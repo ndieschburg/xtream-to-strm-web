@@ -39,7 +39,7 @@ def get_http_client() -> httpx.AsyncClient:
             follow_redirects=True,
             timeout=httpx.Timeout(60.0, connect=10.0),  # Longer timeout for transcoding
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-            http2=True  # Use HTTP/2 when available for better multiplexing
+            http2=True,  # HTTP/2 for better multiplexing
         )
     return _http_client
 

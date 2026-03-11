@@ -1,16 +1,16 @@
 # Xtream to STRM
 
+> **Fork Notice**: This is a fork of [mourabena2-ui/xtream-to-strm-web](https://github.com/mourabena2-ui/xtream-to-strm-web)
+
 <div align="center">
 
 ![Xtream to STRM Logo](frontend/public/Xtreamm-app_Full_Logo.jpg)
 
-**A complete media management platform for Xtream Codes and M3U playlists**  
+**A complete media management platform for Xtream Codes and M3U playlists**
 Generate `.strm` files, download content, and create dynamic M3U playlists for your media server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker Hub](https://img.shields.io/docker/v/mourabena2ui/xtream-to-strm-web?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/mourabena2ui/xtream-to-strm-web)
-[![Docker Pulls](https://img.shields.io/docker/pulls/mourabena2ui/xtream-to-strm-web)](https://hub.docker.com/r/mourabena2ui/xtream-to-strm-web)
-[![Version](https://img.shields.io/badge/version-3.8.0-blue.svg)](https://github.com/mourabena2-ui/xtream-to-strm-web/releases)
+[![Upstream](https://img.shields.io/badge/upstream-mourabena2--ui-blue.svg)](https://github.com/mourabena2-ui/xtream-to-strm-web)
 
 </div>
 

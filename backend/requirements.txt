@@ -4,7 +4,7 @@ sqlalchemy==2.0.25
 alembic==1.13.1
 pydantic==2.6.0
 pydantic-settings==2.1.0
-httpx==0.26.0
+httpx[http2]==0.26.0
 celery==5.3.6
 redis==5.0.1
 python-multipart==0.0.6
