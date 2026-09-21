@@ -17,6 +17,7 @@ class ConfigUpdate(BaseModel):
     SERIES_INCLUDE_NAME_IN_FILENAME: Optional[bool] = None
     SYNC_PARALLELISM_MOVIES: Optional[int] = None
     SYNC_PARALLELISM_SERIES: Optional[int] = None
+    SYNC_RATE_LIMIT_RPS: Optional[float] = None
     SERIES_USE_CATEGORY_FOLDERS: Optional[bool] = None
     MOVIE_USE_CATEGORY_FOLDERS: Optional[bool] = None
     PLEX_PROXY_BASE_URL: Optional[str] = None
@@ -38,6 +39,7 @@ class ConfigResponse(BaseModel):
     SERIES_INCLUDE_NAME_IN_FILENAME: Optional[bool] = None
     SYNC_PARALLELISM_MOVIES: Optional[int] = None
     SYNC_PARALLELISM_SERIES: Optional[int] = None
+    SYNC_RATE_LIMIT_RPS: Optional[float] = None
     SERIES_USE_CATEGORY_FOLDERS: Optional[bool] = None
     MOVIE_USE_CATEGORY_FOLDERS: Optional[bool] = None
     PLEX_PROXY_BASE_URL: Optional[str] = None

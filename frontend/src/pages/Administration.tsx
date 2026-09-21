@@ -17,8 +17,9 @@ export default function Administration() {
     const [cleanName, setCleanName] = useState(false);
     const [useSeasonFolders, setUseSeasonFolders] = useState(true);
     const [includeSeriesName, setIncludeSeriesName] = useState(false);
-    const [parallelismMovies, setParallelismMovies] = useState(10);
+    const [parallelismMovies, setParallelismMovies] = useState(5);
     const [parallelismSeries, setParallelismSeries] = useState(5);
+    const [rateLimitRps, setRateLimitRps] = useState(5);
     const [useCategoryFolders, setUseCategoryFolders] = useState(true);
     const [useMovieCategoryFolders, setUseMovieCategoryFolders] = useState(true);
     const [regexLoading, setRegexLoading] = useState(false);
@@ -63,8 +64,9 @@ export default function Administration() {
                 setCleanName(response.data.CLEAN_NAME === true);
                 setUseSeasonFolders(response.data.SERIES_USE_SEASON_FOLDERS !== false);
                 setIncludeSeriesName(response.data.SERIES_INCLUDE_NAME_IN_FILENAME === true);
-                setParallelismMovies(parseInt(response.data.SYNC_PARALLELISM_MOVIES) || 10);
+                setParallelismMovies(parseInt(response.data.SYNC_PARALLELISM_MOVIES) || 5);
                 setParallelismSeries(parseInt(response.data.SYNC_PARALLELISM_SERIES) || 5);
+                setRateLimitRps(parseFloat(response.data.SYNC_RATE_LIMIT_RPS) || 5);
                 setUseCategoryFolders(response.data.SERIES_USE_CATEGORY_FOLDERS !== false);
                 setUseMovieCategoryFolders(response.data.MOVIE_USE_CATEGORY_FOLDERS !== false);
                 setPlexProxyBaseUrl(response.data.PLEX_PROXY_BASE_URL || 'http://localhost:8000');
@@ -108,7 +110,8 @@ export default function Administration() {
                 SERIES_USE_CATEGORY_FOLDERS: useCategoryFolders,
                 MOVIE_USE_CATEGORY_FOLDERS: useMovieCategoryFolders,
                 SYNC_PARALLELISM_MOVIES: parallelismMovies,
-                SYNC_PARALLELISM_SERIES: parallelismSeries
+                SYNC_PARALLELISM_SERIES: parallelismSeries,
+                SYNC_RATE_LIMIT_RPS: rateLimitRps
             });
             toast.success('Settings saved successfully!');
         } catch (error) {
@@ -599,9 +602,9 @@ export default function Administration() {
                                 min="1"
                                 max="50"
                                 value={parallelismMovies}
-                                onChange={(e) => setParallelismMovies(parseInt(e.target.value) || 10)}
+                                onChange={(e) => setParallelismMovies(parseInt(e.target.value) || 5)}
                             />
-                            <p className="text-xs text-muted-foreground">Default: 10. Higher values need more RAM/CPU.</p>
+                            <p className="text-xs text-muted-foreground">Default: 5. Higher values need more RAM/CPU.</p>
                         </div>
 
                         <div className="space-y-2">
@@ -614,6 +617,22 @@ export default function Administration() {
                                 onChange={(e) => setParallelismSeries(parseInt(e.target.value) || 5)}
                             />
                             <p className="text-xs text-muted-foreground">Default: 5. Series sync is intensive.</p>
+                        </div>
+
+                        <div className="space-y-2">
+                            <label className="text-sm font-medium">Xtream Rate Limit (requests / second)</label>
+                            <Input
+                                type="number"
+                                min="0.5"
+                                max="50"
+                                step="0.5"
+                                value={rateLimitRps}
+                                onChange={(e) => setRateLimitRps(parseFloat(e.target.value) || 5)}
+                            />
+                            <p className="text-xs text-muted-foreground">
+                                Default: 5. Caps how fast the provider's API is called. The sync slows down
+                                automatically when the provider answers 429/503, then speeds back up.
+                            </p>
                         </div>
 
                         <Button

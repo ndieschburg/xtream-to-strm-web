@@ -1,14 +1,31 @@
 import { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Pause, Play, Trash2, Download } from 'lucide-react';
 
+// EventSource cannot read the response status, so an expired token turns into an
+// endless reconnect loop of 401s. Check the expiry before opening the stream.
+const isTokenExpired = (token: string | null): boolean => {
+    if (!token) return true;
+    try {
+        const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        const padded = part.padEnd(part.length + ((4 - (part.length % 4)) % 4), '=');
+        const { exp } = JSON.parse(atob(padded));
+        return typeof exp !== 'number' || exp * 1000 <= Date.now();
+    } catch {
+        return true;
+    }
+};
+
 export default function Logs() {
+    const navigate = useNavigate();
     const [logs, setLogs] = useState<string[]>([]);
     const [isPaused, setIsPaused] = useState(false);
     const [isConnected, setIsConnected] = useState(false);
     const logsEndRef = useRef<HTMLDivElement>(null);
     const eventSourceRef = useRef<EventSource | null>(null);
+    const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const pausedLogsRef = useRef<string[]>([]);
 
     const scrollToBottom = () => {
@@ -27,11 +44,21 @@ export default function Logs() {
             if (eventSourceRef.current) {
                 eventSourceRef.current.close();
             }
+            if (reconnectRef.current) {
+                clearTimeout(reconnectRef.current);
+            }
         };
     }, []);
 
     const connectToLogs = () => {
         const token = localStorage.getItem('token');
+
+        if (isTokenExpired(token)) {
+            localStorage.removeItem('token');
+            navigate('/login', { replace: true });
+            return;
+        }
+
         const es = new EventSource(`/api/v1/logs/stream?token=${token}`);
 
         es.onopen = () => {
@@ -52,7 +79,7 @@ export default function Logs() {
             console.error('Lost connection to logs stream');
             es.close();
             // Reconnect after 5 seconds
-            setTimeout(connectToLogs, 5000);
+            reconnectRef.current = setTimeout(connectToLogs, 5000);
         };
 
         eventSourceRef.current = es;

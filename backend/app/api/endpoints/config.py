@@ -56,6 +56,15 @@ def get_config(db: Session = Depends(get_db)):
             except (ValueError, TypeError):
                 pass
 
+    # Convert string floats to actual floats
+    float_fields = ["SYNC_RATE_LIMIT_RPS"]
+    for field in float_fields:
+        if field in settings:
+            try:
+                settings[field] = float(settings[field])
+            except (ValueError, TypeError):
+                pass
+
     return ConfigResponse(**settings)
 
 @router.post("/", response_model=ConfigResponse)
@@ -89,6 +98,8 @@ def update_config(config: ConfigUpdate, db: Session = Depends(get_db)):
         updates["SYNC_PARALLELISM_MOVIES"] = str(config.SYNC_PARALLELISM_MOVIES)
     if config.SYNC_PARALLELISM_SERIES is not None:
         updates["SYNC_PARALLELISM_SERIES"] = str(config.SYNC_PARALLELISM_SERIES)
+    if config.SYNC_RATE_LIMIT_RPS is not None:
+        updates["SYNC_RATE_LIMIT_RPS"] = str(config.SYNC_RATE_LIMIT_RPS)
     if config.SERIES_USE_CATEGORY_FOLDERS is not None:
         updates["SERIES_USE_CATEGORY_FOLDERS"] = str(config.SERIES_USE_CATEGORY_FOLDERS).lower()
     if config.MOVIE_USE_CATEGORY_FOLDERS is not None:

@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     XC_USER: Optional[str] = None
     XC_PASS: Optional[str] = None
     
+    # Xtream API throttling (see services/xtream.py) - DB setting
+    # SYNC_RATE_LIMIT_RPS overrides the rate per install
+    XTREAM_RATE_LIMIT_RPS: float = 5.0
+    XTREAM_MAX_CONNECTIONS: int = 10
+    XTREAM_MAX_RETRIES: int = 4
+    XTREAM_BACKOFF_BASE: float = 2.0
+    XTREAM_BACKOFF_MAX: float = 60.0
+
     # Output directories
     OUTPUT_DIR: str = "/output"
     MOVIES_DIR: str = "/output/movies"

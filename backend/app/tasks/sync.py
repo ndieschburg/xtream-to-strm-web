@@ -11,11 +11,52 @@ from app.models.cache import MovieCache, SeriesCache, EpisodeCache
 from app.models.schedule import Schedule, SyncType as ScheduleSyncType
 from app.models.schedule_execution import ScheduleExecution, ExecutionStatus
 from app.services.xtream import XtreamClient
+from app.core.config import settings as config_settings
 from app.services.file_manager import FileManager
 import logging
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_PARALLELISM = {"SYNC_PARALLELISM_MOVIES": 5, "SYNC_PARALLELISM_SERIES": 5}
+
+
+def _int_setting(settings: dict, key: str, default: int) -> int:
+    try:
+        return max(1, int(settings.get(key, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def build_xtream_client(db: Session, sub: Subscription, parallelism_key: str) -> XtreamClient:
+    """Build a client throttled with the rate limit configured in Administration.
+
+    The connection pool is sized to the parallelism so a sync reuses keep-alive
+    connections instead of opening a new one per request.
+    """
+    from app.models.settings import SettingsModel
+    settings_map = {s.key: s.value for s in db.query(SettingsModel).all()}
+
+    parallelism = _int_setting(settings_map, parallelism_key, DEFAULT_PARALLELISM[parallelism_key])
+    try:
+        rate_limit = float(settings_map.get("SYNC_RATE_LIMIT_RPS", config_settings.XTREAM_RATE_LIMIT_RPS))
+    except (TypeError, ValueError):
+        rate_limit = config_settings.XTREAM_RATE_LIMIT_RPS
+
+    logger.info(f"Xtream client: {parallelism} parallel requests, max {rate_limit:.2f} req/s")
+    return XtreamClient(
+        sub.xtream_url, sub.username, sub.password,
+        rate_limit=rate_limit, max_connections=parallelism
+    )
+
+
+async def _run_and_close(coro, xc: XtreamClient):
+    """Await a sync coroutine, then release the client's connection pool."""
+    try:
+        return await coro
+    finally:
+        await xc.aclose()
 
 
 def trigger_jellyfin_refresh(db: Session, library_type: str):
@@ -154,11 +195,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
             db.delete(movie)
         
         # Process Additions/Updates with Parallel Fetching
-        try:
-            parallelism = int(settings.get("SYNC_PARALLELISM_MOVIES", "10"))
-        except ValueError:
-            parallelism = 10
-            
+        parallelism = _int_setting(settings, "SYNC_PARALLELISM_MOVIES", DEFAULT_PARALLELISM["SYNC_PARALLELISM_MOVIES"])
         batch_size = parallelism
         semaphore = asyncio.Semaphore(batch_size)
 
@@ -172,6 +209,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                     tmdb_id = movie.get('tmdb')
 
                     # Fetch detailed info for Metadata
+                    metadata_ok = True
                     try:
                         detailed_info = await xc.get_vod_info(str(stream_id))
                         if detailed_info and 'info' in detailed_info:
@@ -181,8 +219,10 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                                 tmdb_id = detailed_info['info'].get('tmdb_id')
                                 movie['tmdb'] = tmdb_id # Update for object
                     except Exception as e:
-                        # logger.warning(f"Failed to fetch info for movie {stream_id}: {e}")
-                        pass
+                        # Only a failed request is worth retrying: a valid answer
+                        # without 'info' means the panel simply has no metadata
+                        metadata_ok = False
+                        logger.warning(f"Failed to fetch info for movie {stream_id}: {e}")
 
                     cat_name = cat_map.get(cat_id, "Uncategorized")
                     target_info = fm.get_movie_target_info(movie, cat_name, prefix_regex, format_date, clean_name, use_category_folders)
@@ -206,6 +246,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                     # Ideally accumulate results and bulk update, but for safety lets return data
                     return {
                         'action': 'update_cache',
+                        'metadata_ok': metadata_ok,
                         'data': {
                             'stream_id': stream_id,
                             'name': name,
@@ -223,6 +264,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
         # But for 10 concurrent, direct gather is fine usually.
         # Let's process in batches of 50 to update DB incrementally
         total_processed = 0
+        metadata_failures = 0
         chunk_size = 50
         
         for i in range(0, len(to_add_update), chunk_size):
@@ -232,6 +274,12 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
             for res in results:
                 if res and res['action'] == 'update_cache':
                     d = res['data']
+                    if not res.get('metadata_ok', True):
+                        # Keep it out of the cache: otherwise the next sync sees
+                        # it as up to date and the NFO stays metadata-less forever
+                        metadata_failures += 1
+                        continue
+
                     cached = cached_movies.get(d['stream_id'])
                     if not cached:
                         cached = MovieCache(subscription_id=subscription_id, stream_id=d['stream_id'])
@@ -243,6 +291,12 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                     cached.tmdb_id = d['tmdb_id']
             
             db.commit() # Commit every chunk
+
+        if metadata_failures:
+            logger.warning(
+                f"{metadata_failures} movies written without metadata, "
+                f"not cached so the next sync retries them"
+            )
 
         sync_state.items_added = len(to_add_update)
         sync_state.items_deleted = len(to_delete)
@@ -348,11 +402,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
 
         # Process ALL selected series (not just new/changed)
         # Episode cache will prevent unnecessary file writes
-        try:
-            parallelism = int(settings.get("SYNC_PARALLELISM_SERIES", "5"))
-        except ValueError:
-            parallelism = 5
-
+        parallelism = _int_setting(settings, "SYNC_PARALLELISM_SERIES", DEFAULT_PARALLELISM["SYNC_PARALLELISM_SERIES"])
         batch_size = parallelism
         semaphore = asyncio.Semaphore(batch_size)
 
@@ -582,10 +632,10 @@ def sync_movies_task(subscription_id: int, execution_id: int = None):
             db.add(execution)
             db.commit()
 
-        xc = XtreamClient(sub.xtream_url, sub.username, sub.password)
+        xc = build_xtream_client(db, sub, "SYNC_PARALLELISM_MOVIES")
         fm = FileManager(sub.movies_dir)
 
-        asyncio.run(process_movies(db, xc, fm, subscription_id))
+        asyncio.run(_run_and_close(process_movies(db, xc, fm, subscription_id), xc))
 
         # Refresh session to get updated sync_state values
         db.expire_all()
@@ -655,10 +705,10 @@ def sync_series_task(subscription_id: int, execution_id: int = None):
             db.add(execution)
             db.commit()
 
-        xc = XtreamClient(sub.xtream_url, sub.username, sub.password)
+        xc = build_xtream_client(db, sub, "SYNC_PARALLELISM_SERIES")
         fm = FileManager(sub.series_dir)
 
-        asyncio.run(process_series(db, xc, fm, subscription_id))
+        asyncio.run(_run_and_close(process_series(db, xc, fm, subscription_id), xc))
 
         # Refresh session to get updated sync_state values
         db.expire_all()
