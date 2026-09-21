@@ -53,14 +53,16 @@ async def close_http_client():
         logger.info("Plex HLS HTTP client closed")
 
 
-def get_plex_headers(access_token: str) -> dict:
+def get_plex_headers(access_token: str, session_id: str = None) -> dict:
     """
     Generate standard Plex API headers to maintain session.
 
     @param access_token Plex server access token
+    @param session_id Stable session identifier, so Plex reuses one transcode
+    session for the whole playback instead of opening one per request
     @returns Dict of headers to include in requests
     """
-    return {
+    headers = {
         "X-Plex-Token": access_token,
         "X-Plex-Client-Identifier": "xtream-to-strm",
         "X-Plex-Product": "Xtream to STRM",
@@ -70,10 +72,133 @@ def get_plex_headers(access_token: str) -> dict:
         "Connection": "keep-alive",
     }
 
+    if session_id:
+        headers["X-Plex-Session-Identifier"] = session_id
+
+    return headers
+
+
+# Query parameters whose values must never reach the logs or an HTTP response
+_SENSITIVE_QUERY_PARAMS = ("X-Plex-Token", "key")
+
+
+def _redact_url(url: str) -> str:
+    """
+    Mask credential query parameters so a URL can safely be logged.
+
+    @param url URL that may carry a Plex token or the proxy shared key
+    @returns Same URL with sensitive parameter values replaced by a placeholder
+
+    @example
+    _redact_url("https://plex.direct:32400/start.m3u8?X-Plex-Token=abc&offset=0")
+    # -> "https://plex.direct:32400/start.m3u8?X-Plex-Token=%3Credacted%3E&offset=0"
+    """
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if not parsed.query:
+            return url
+
+        redacted = [
+            (name, "<redacted>" if name in _SENSITIVE_QUERY_PARAMS else value)
+            for name, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+        return urllib.parse.urlunsplit(
+            parsed._replace(query=urllib.parse.urlencode(redacted))
+        )
+    except Exception:
+        # Log formatting must never break a request
+        return "<unparsable url>"
+
+
+def _describe_upstream_failure(exc: Exception, url: str, started_at: float) -> str:
+    """
+    Build a diagnostic line for a failed request to the Plex server.
+
+    @description httpx timeout exceptions carry an empty message, so `str(exc)`
+    alone is unusable. The exception class plus the elapsed time are what
+    identify the failure: a ConnectTimeout near the connect deadline means the
+    server URI is unreachable, while a ReadTimeout near the read deadline means
+    Plex accepted the connection but never answered (typically a stalled
+    transcode session).
+
+    @param exc Exception raised while calling Plex
+    @param url Upstream URL that was requested (redacted before logging)
+    @param started_at time.monotonic() captured just before the request
+    @returns Diagnostic string safe to log
+
+    @example
+    logger.error(f"playlist failed: {_describe_upstream_failure(e, url, t0)}")
+    # -> "playlist failed: type=httpx.ReadTimeout elapsed=60.0s repr=... url=..."
+    """
+    details = [
+        f"type=httpx.{type(exc).__name__}" if isinstance(exc, httpx.HTTPError)
+        else f"type={type(exc).__module__}.{type(exc).__name__}",
+        f"elapsed={time.monotonic() - started_at:.1f}s",
+    ]
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        # The upstream body is dropped by httpx's own message but often holds
+        # the actual Plex error (XML <Response code="..." status="..."/>)
+        details.append(f"status={exc.response.status_code}")
+        details.append(f"body={exc.response.text[:300]!r}")
+
+    details.append(f"repr={exc!r}")
+    details.append(f"url={_redact_url(url)}")
+    return " ".join(details)
+
 
 def stable_hash(s: str) -> str:
     """Generate a stable hash for a string (deterministic across processes)."""
     return hashlib.md5(s.encode()).hexdigest()[:16]
+
+
+# 64 KiB keeps the relay responsive without a syscall per TS packet
+_SEGMENT_CHUNK_SIZE = 65536
+
+# Upstream media types accepted for a segment; anything else is an error page
+_SEGMENT_MEDIA_PREFIXES = ("video/", "audio/", "application/octet-stream")
+
+
+async def relay_segment(response: httpx.Response):
+    """
+    Relay an already-open segment response to the client, chunk by chunk.
+
+    @description The upstream response is handed over open so the first bytes
+    reach the player immediately. Buffering a whole segment added its full
+    download time to every single one, which stalls playback when Plex emits
+    one-second segments. The connection is released even if the client
+    disconnects halfway through.
+
+    @param response Open streaming response from the shared HTTP client
+    @yields Chunks of the segment body
+
+    @example
+    return StreamingResponse(relay_segment(response), media_type="video/mp2t")
+    """
+    try:
+        async for chunk in response.aiter_bytes(_SEGMENT_CHUNK_SIZE):
+            yield chunk
+    finally:
+        await response.aclose()
+
+
+def build_session_identifier(server_id: int, rating_key: int) -> str:
+    """
+    Build a stable Plex session identifier for one media item.
+
+    @description Plex opens a new transcode session for every request carrying a
+    different session identifier. Without a stable value, each reload of the
+    master playlist spawned another session: transcodes piled up on the server
+    and Plex could invalidate the playlist already handed to the player.
+
+    @param server_id Database ID of the Plex server
+    @param rating_key Plex rating key of the media
+    @returns Deterministic identifier, stable across requests and processes
+
+    @example
+    build_session_identifier(2, 34304)  # -> "xts-0b1c2d3e4f506172"
+    """
+    return f"xts-{stable_hash(f'{server_id}:{rating_key}')}"
 
 def rewrite_playlist_urls(
     content: str,
@@ -132,11 +257,12 @@ from app.models.settings import SettingsModel
 from app.schemas import (
     PlexLoginRequest, PlexLoginResponse,
     PlexAccountCreate, PlexAccountResponse,
+    PlexAccountTokenRefresh, PlexTokenRefreshResponse,
     PlexServerResponse, PlexServerUpdate,
     PlexLibraryResponse, PlexLibrarySelection,
     PlexSyncStatusResponse
 )
-from app.services.plex import PlexClient
+from app.services.plex import PlexClient, PlexAuthError, PlexApiError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -153,7 +279,7 @@ def plex_login(request: PlexLoginRequest):
     @param request Login credentials (username/password)
     @returns Success status with auth token if successful
     """
-    result = PlexClient.login(request.username, request.password)
+    result = PlexClient.login(request.username, request.password, code=request.code)
     return PlexLoginResponse(
         success=result.get("success", False),
         message=result.get("message", "Unknown error"),
@@ -199,27 +325,11 @@ def create_account(account: PlexAccountCreate, db: Session = Depends(deps.get_db
     db.commit()
     db.refresh(db_account)
 
-    # Fetch and store servers
+    # Fetch and store servers; the account stays usable if this step fails
     try:
-        client = PlexClient(result["auth_token"])
-        servers = client.get_servers()
-        for srv in servers:
-            safe_name = srv["name"].replace(" ", "_").replace("/", "_").replace("\\", "_")
-            db_server = PlexServer(
-                account_id=db_account.id,
-                server_id=srv["server_id"],
-                name=srv["name"],
-                uri=srv["uri"],
-                access_token=srv["access_token"],
-                version=srv.get("version"),
-                is_owned=srv.get("is_owned", False),
-                movies_dir=f"{account.output_base_dir}/{safe_name}/movies",
-                series_dir=f"{account.output_base_dir}/{safe_name}/series"
-            )
-            db.add(db_server)
-        db.commit()
-    except Exception as e:
-        logger.error(f"Failed to fetch servers for new account: {e}")
+        _sync_servers_for_account(db, db_account)
+    except (PlexAuthError, PlexApiError) as e:
+        logger.error(f"Failed to fetch servers for new account '{db_account.name}': {e}")
         # Account created, servers can be refreshed later
 
     return db_account
@@ -251,6 +361,146 @@ def delete_account(account_id: int, db: Session = Depends(deps.get_db)):
     return {"message": "Account deleted"}
 
 
+@router.put("/accounts/{account_id}/token", response_model=PlexTokenRefreshResponse)
+def refresh_account_token(
+    account_id: int,
+    request: PlexAccountTokenRefresh,
+    db: Session = Depends(deps.get_db)
+):
+    """
+    Re-authenticate an existing account and store a fresh Plex.tv token.
+
+    @description Plex.tv revokes tokens on a password change or when the device
+    is removed from the authorized list. Without this endpoint the only way to
+    renew one was to delete and recreate the account, which cascades and destroys
+    its servers, libraries, caches and schedules. Server URIs are refreshed right
+    after, since that is what a stale token was blocking.
+
+    @param account_id Account whose token must be renewed
+    @param request Plex.tv password and optional two-factor code
+    @returns Renewal result, including how many servers were re-synced
+
+    @example
+    PUT /api/v1/plex/accounts/1/token
+    {"password": "...", "code": "123456"}
+    """
+    account = db.query(PlexAccount).filter(PlexAccount.id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    result = PlexClient.login(account.username, request.password, code=request.code)
+    if not result.get("success"):
+        logger.warning(f"Token renewal failed for account '{account.name}'")
+        raise HTTPException(status_code=401, detail=result.get("message", "Login failed"))
+
+    account.auth_token = result["auth_token"]
+    db.commit()
+    logger.info(f"Plex.tv token renewed for account '{account.name}'")
+
+    try:
+        summary = _sync_servers_for_account(db, account)
+    except (PlexAuthError, PlexApiError) as e:
+        # The token itself is valid, so this is not a failure of the renewal
+        logger.error(f"Server refresh after token renewal failed: {e}")
+        return PlexTokenRefreshResponse(
+            success=True,
+            message=f"Token renewed, but refreshing servers failed: {e}",
+        )
+
+    return PlexTokenRefreshResponse(
+        success=True,
+        message=_describe_sync(summary, "Token renewed"),
+        servers_refreshed=summary["total"],
+        unreachable=summary["unreachable"],
+    )
+
+
+def _sync_servers_for_account(db: Session, account: PlexAccount) -> Dict[str, Any]:
+    """
+    Fetch an account's servers from Plex.tv and upsert them into the database.
+
+    @description Shared by account creation, the manual refresh and the token
+    renewal so the upsert rules live in one place. An unreachable URI never
+    overwrites a stored one that still works: Plex.tv keeps advertising stale
+    addresses, and clobbering a good URI with a dead one is what broke playback.
+
+    @param db Active database session
+    @param account Account whose servers must be refreshed
+    @returns Summary with total, added, updated and unreachable server names
+    @raises PlexAuthError When Plex.tv rejects the account token
+    @raises PlexApiError When the Plex.tv request fails for another reason
+
+    @example
+    summary = _sync_servers_for_account(db, account)
+    if summary["unreachable"]:
+        warn(summary["unreachable"])
+    """
+    servers = PlexClient(account.auth_token).get_servers()
+
+    existing = {
+        s.server_id: s
+        for s in db.query(PlexServer).filter(PlexServer.account_id == account.id).all()
+    }
+
+    added = 0
+    updated = 0
+    unreachable: List[str] = []
+
+    for srv in servers:
+        if not srv.get("uri_reachable", True):
+            unreachable.append(srv["name"])
+
+        row = existing.get(srv["server_id"])
+        if row:
+            # Only trust a probed URI; otherwise keep whatever already works
+            if srv.get("uri_reachable"):
+                row.uri = srv["uri"]
+            row.access_token = srv["access_token"]
+            row.version = srv.get("version")
+            row.name = srv["name"]
+            updated += 1
+        else:
+            safe_name = srv["name"].replace(" ", "_").replace("/", "_").replace("\\", "_")
+            db.add(PlexServer(
+                account_id=account.id,
+                server_id=srv["server_id"],
+                name=srv["name"],
+                uri=srv["uri"],
+                access_token=srv["access_token"],
+                version=srv.get("version"),
+                is_owned=srv.get("is_owned", False),
+                movies_dir=f"{account.output_base_dir}/{safe_name}/movies",
+                series_dir=f"{account.output_base_dir}/{safe_name}/series"
+            ))
+            added += 1
+
+    db.commit()
+    logger.info(
+        f"Plex servers synced for '{account.name}': total={len(servers)} "
+        f"added={added} updated={updated} unreachable={unreachable}"
+    )
+    return {
+        "total": len(servers),
+        "added": added,
+        "updated": updated,
+        "unreachable": unreachable,
+    }
+
+
+def _describe_sync(summary: Dict[str, Any], prefix: str) -> str:
+    """
+    Turn a sync summary into a message suitable for the UI.
+
+    @param summary Result of _sync_servers_for_account
+    @param prefix Leading sentence, e.g. "Token renewed"
+    @returns Single-line human readable message
+    """
+    message = f"{prefix}, {summary['total']} server(s) refreshed"
+    if summary["unreachable"]:
+        message += f" - unreachable: {', '.join(summary['unreachable'])}"
+    return message
+
+
 # --- Server Management ---
 
 @router.get("/servers/{account_id}", response_model=List[PlexServerResponse])
@@ -267,46 +517,31 @@ def get_servers(account_id: int, db: Session = Depends(deps.get_db)):
 @router.post("/servers/{account_id}/refresh")
 def refresh_servers(account_id: int, db: Session = Depends(deps.get_db)):
     """
-    Refresh server list from Plex.tv.
+    Refresh server list and connection URIs from Plex.tv.
+
+    @description A revoked token used to be swallowed and reported as a success
+    with zero servers updated, which made the button look broken. Failures now
+    surface as 401/502 so the UI can tell the user to renew the token.
 
     @param account_id Account ID to refresh servers for
+    @returns Summary with the number of servers seen and any unreachable ones
     """
     account = db.query(PlexAccount).filter(PlexAccount.id == account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    client = PlexClient(account.auth_token)
-    servers = client.get_servers()
+    try:
+        summary = _sync_servers_for_account(db, account)
+    except PlexAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except PlexApiError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-    # Update or add servers
-    existing = {s.server_id: s for s in db.query(PlexServer).filter(PlexServer.account_id == account_id).all()}
-
-    for srv in servers:
-        if srv["server_id"] in existing:
-            # Update existing server
-            existing_srv = existing[srv["server_id"]]
-            existing_srv.uri = srv["uri"]
-            existing_srv.access_token = srv["access_token"]
-            existing_srv.version = srv.get("version")
-            existing_srv.name = srv["name"]
-        else:
-            # Add new server
-            safe_name = srv["name"].replace(" ", "_").replace("/", "_").replace("\\", "_")
-            db_server = PlexServer(
-                account_id=account_id,
-                server_id=srv["server_id"],
-                name=srv["name"],
-                uri=srv["uri"],
-                access_token=srv["access_token"],
-                version=srv.get("version"),
-                is_owned=srv.get("is_owned", False),
-                movies_dir=f"{account.output_base_dir}/{safe_name}/movies",
-                series_dir=f"{account.output_base_dir}/{safe_name}/series"
-            )
-            db.add(db_server)
-
-    db.commit()
-    return {"message": "Servers refreshed", "count": len(servers)}
+    return {
+        "message": _describe_sync(summary, "Servers refreshed"),
+        "count": summary["total"],
+        **summary,
+    }
 
 
 @router.put("/servers/{server_id}", response_model=PlexServerResponse)
@@ -585,6 +820,9 @@ async def proxy_plex_stream(
     hls_proxy_setting = db.query(SettingsModel).filter(SettingsModel.key == "PLEX_HLS_PROXY_MODE").first()
     hls_proxy_enabled = hls_proxy_setting and hls_proxy_setting.value.lower() == "true"
 
+    # One stable session per media item, reused by every request below
+    session_id = build_session_identifier(server_id, rating_key)
+
     # Build Plex streaming URL
     params = {
         'path': f'/library/metadata/{rating_key}',
@@ -601,6 +839,7 @@ async def proxy_plex_stream(
         'X-Plex-Platform': 'Chrome',
         'X-Plex-Client-Identifier': 'xtream-to-strm',
         'X-Plex-Product': 'Xtream to STRM',
+        'X-Plex-Session-Identifier': session_id,
         'X-Plex-Token': server.access_token,
     }
 
@@ -615,14 +854,43 @@ async def proxy_plex_stream(
     proxy_base_setting = db.query(SettingsModel).filter(SettingsModel.key == "PLEX_PROXY_BASE_URL").first()
     proxy_base_url = (proxy_base_setting.value if proxy_base_setting else "").rstrip('/')
 
+    if not proxy_base_url:
+        logger.warning(
+            "PLEX_PROXY_BASE_URL is not set: rewritten playlist URLs will be "
+            "relative and most clients will fail to resolve them"
+        )
+
+    logger.info(
+        f"HLS proxy request: server_id={server_id} rating_key={rating_key} "
+        f"upstream={_redact_url(plex_url)}"
+    )
+
+    started_at = time.monotonic()
+
     try:
         client = get_http_client()
-        headers = get_plex_headers(server.access_token)
+        headers = get_plex_headers(server.access_token, session_id)
         response = await client.get(plex_url, headers=headers)
         response.raise_for_status()
 
         master_content = response.text
-        logger.info(f"HLS master playlist fetched, length={len(master_content)}")
+        logger.info(
+            f"HLS master playlist fetched in {time.monotonic() - started_at:.1f}s, "
+            f"status={response.status_code} http={response.http_version} "
+            f"content_type={response.headers.get('content-type')} length={len(master_content)}"
+        )
+
+        # Plex can answer 200 with an XML/HTML error instead of a playlist, which
+        # would otherwise be rewritten into a valid-looking but unplayable file.
+        # A leading BOM is tolerated so a valid playlist is never rejected here.
+        if not master_content.lstrip("﻿ \t\r\n").startswith("#EXTM3U"):
+            logger.error(
+                f"HLS master playlist is not an M3U8 document: {master_content[:300]!r}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Plex did not return an HLS playlist"
+            )
 
         # Rewrite ALL URLs to go through our proxy (both playlists AND segments)
         rewritten_content = rewrite_playlist_urls(
@@ -644,9 +912,28 @@ async def proxy_plex_stream(
                 "Cache-Control": "no-cache, no-store, must-revalidate"
             }
         )
+    except HTTPException:
+        # Already diagnosed above, keep the intended status code
+        raise
     except httpx.HTTPError as e:
-        logger.error(f"HLS proxy error: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to fetch HLS playlist: {str(e)}")
+        logger.error(
+            f"HLS master playlist error: {_describe_upstream_failure(e, plex_url, started_at)}"
+        )
+        # str(e) is empty for timeouts and leaks the Plex token for status
+        # errors, so only the exception class is exposed to the client
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch HLS playlist ({type(e).__name__})"
+        )
+    except Exception as e:
+        logger.exception(
+            f"HLS master playlist unexpected error: "
+            f"{_describe_upstream_failure(e, plex_url, started_at)}"
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unexpected error fetching HLS playlist ({type(e).__name__})"
+        )
 
 
 @router.get("/hls-stream/{server_id}/{rating_key}")
@@ -696,15 +983,28 @@ async def hls_stream(
     is_playlist = decoded_url.endswith(".m3u8") or "m3u8" in decoded_url
 
     client = get_http_client()
-    headers = get_plex_headers(server.access_token)
+    headers = get_plex_headers(
+        server.access_token,
+        build_session_identifier(server_id, rating_key)
+    )
 
     if is_playlist:
         # For playlists, fetch fully and rewrite URLs
+        logger.info(
+            f"HLS playlist request: server_id={server_id} rating_key={rating_key} "
+            f"upstream={_redact_url(decoded_url)}"
+        )
+        started_at = time.monotonic()
+
         try:
             response = await client.get(decoded_url, headers=headers)
             response.raise_for_status()
 
             content = response.text
+            logger.info(
+                f"HLS playlist fetched in {time.monotonic() - started_at:.1f}s, "
+                f"status={response.status_code} length={len(content)}"
+            )
             rewritten_content = rewrite_playlist_urls(
                 content=content,
                 base_url=decoded_url,
@@ -725,56 +1025,125 @@ async def hls_stream(
                 }
             )
         except httpx.HTTPError as e:
-            logger.error(f"HLS playlist proxy error for {decoded_url[:80]}...: {e}")
-            raise HTTPException(status_code=502, detail=f"Failed to fetch HLS playlist: {str(e)}")
+            logger.error(
+                f"HLS playlist error: {_describe_upstream_failure(e, decoded_url, started_at)}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to fetch HLS playlist ({type(e).__name__})"
+            )
+        except Exception as e:
+            logger.exception(
+                f"HLS playlist unexpected error: "
+                f"{_describe_upstream_failure(e, decoded_url, started_at)}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unexpected error fetching HLS playlist ({type(e).__name__})"
+            )
     else:
-        # For segments (.ts), fetch with retry then stream
+        # Segments are relayed as they arrive: the status code is checked before
+        # any body is read, so a retry is still possible, but a successful
+        # segment is never buffered in full before the player gets its first byte
         max_retries = 2
-        last_error = None
+
+        logger.debug(f"HLS segment request: upstream={_redact_url(decoded_url)}")
 
         for attempt in range(max_retries):
+            started_at = time.monotonic()
+            response = None
             try:
-                # Fetch the segment (non-streaming first to allow retry)
-                response = await client.get(decoded_url, headers=headers)
-                response.raise_for_status()
+                request = client.build_request("GET", decoded_url, headers=headers)
+                response = await client.send(request, stream=True)
 
-                # Success - return the content
-                return Response(
-                    content=response.content,
-                    media_type="video/mp2t",
+                if response.status_code >= 400:
+                    # Read the short error body so it reaches the logs
+                    await response.aread()
+                    response.raise_for_status()
+
+                # Plex can answer 200 with an XML error; forwarding that as
+                # video/mp2t injects garbage into the stream and leaves the
+                # demuxer unable to lock onto a packet size
+                upstream_type = response.headers.get("content-type", "")
+                if upstream_type and not upstream_type.startswith(_SEGMENT_MEDIA_PREFIXES):
+                    await response.aread()
+                    logger.error(
+                        f"Segment is not media: content_type={upstream_type!r} "
+                        f"body={response.text[:200]!r} url={_redact_url(decoded_url)}"
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Plex did not return a media segment"
+                    )
+
+                logger.debug(
+                    f"Segment relay started: status={response.status_code} "
+                    f"length={response.headers.get('content-length')} "
+                    f"ttfb={time.monotonic() - started_at:.2f}s"
+                )
+                return StreamingResponse(
+                    relay_segment(response),
+                    media_type=upstream_type or "video/mp2t",
                     headers={
                         "Access-Control-Allow-Origin": "*",
                         "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Connection": "keep-alive"
                     }
                 )
             except httpx.HTTPStatusError as e:
-                last_error = e
+                if response is not None:
+                    await response.aclose()
+                diagnosis = _describe_upstream_failure(e, decoded_url, started_at)
+
                 if e.response.status_code == 404:
                     # 404 means segment may not be ready yet or expired
                     if attempt < max_retries - 1:
-                        logger.warning(f"Segment 404, retry {attempt + 1}/{max_retries}: ...{decoded_url[-50:]}")
+                        logger.warning(
+                            f"Segment 404, retry {attempt + 1}/{max_retries}: {diagnosis}"
+                        )
                         await asyncio.sleep(0.3 * (attempt + 1))  # Brief backoff
                         continue
-                    else:
-                        logger.error(f"Segment 404 after {max_retries} retries: ...{decoded_url[-50:]}")
-                        raise HTTPException(status_code=502, detail="Segment not available (404)")
-                else:
-                    logger.error(f"Segment HTTP error {e.response.status_code}: ...{decoded_url[-50:]}")
-                    raise HTTPException(status_code=502, detail=f"Plex returned {e.response.status_code}")
+
+                    logger.error(f"Segment 404 after {max_retries} retries: {diagnosis}")
+                    raise HTTPException(status_code=502, detail="Segment not available (404)")
+
+                logger.error(f"Segment HTTP error: {diagnosis}")
+                raise HTTPException(status_code=502, detail=f"Plex returned {e.response.status_code}")
             except httpx.RequestError as e:
-                last_error = e
+                if response is not None:
+                    await response.aclose()
+                diagnosis = _describe_upstream_failure(e, decoded_url, started_at)
+
                 if attempt < max_retries - 1:
-                    logger.warning(f"Segment request error, retry {attempt + 1}/{max_retries}: {e}")
+                    logger.warning(
+                        f"Segment request error, retry {attempt + 1}/{max_retries}: {diagnosis}"
+                    )
                     await asyncio.sleep(0.3 * (attempt + 1))
                     continue
-                else:
-                    logger.error(f"Segment request error after {max_retries} retries: {e}")
-                    raise HTTPException(status_code=502, detail=f"Failed to fetch segment: {str(e)}")
 
-        # If we get here, all retries failed
-        if last_error:
-            raise HTTPException(status_code=502, detail=f"Failed after {max_retries} retries")
+                logger.error(f"Segment request error after {max_retries} retries: {diagnosis}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to fetch segment ({type(e).__name__})"
+                )
+            except HTTPException:
+                # Already diagnosed above; release the upstream connection
+                if response is not None:
+                    await response.aclose()
+                raise
+            except Exception as e:
+                if response is not None:
+                    await response.aclose()
+                logger.exception(
+                    f"Segment unexpected error: "
+                    f"{_describe_upstream_failure(e, decoded_url, started_at)}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Unexpected error fetching segment ({type(e).__name__})"
+                )
+
+        # Only reachable if every attempt asked for a retry
+        raise HTTPException(status_code=502, detail=f"Failed after {max_retries} retries")
 
 
 @router.get("/hls-cache/{server_id}/{rating_key}")

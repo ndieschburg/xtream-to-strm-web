@@ -3,7 +3,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Plus, Trash2, Save, X, Server, Loader2 } from 'lucide-react';
+import { Plus, Trash2, Save, X, Server, Loader2, KeyRound } from 'lucide-react';
+import { useToast } from "@/components/ui/toast";
 import api from '@/lib/api';
 
 interface PlexAccount {
@@ -21,12 +22,24 @@ interface PlexAccountForm {
     output_base_dir: string;
 }
 
+interface TokenRefreshResponse {
+    success: boolean;
+    message: string;
+    servers_refreshed: number;
+    unreachable: string[];
+}
+
 export default function PlexAccounts() {
     const [accounts, setAccounts] = useState<PlexAccount[]>([]);
     const [loading, setLoading] = useState(false);
     const [isAdding, setIsAdding] = useState(false);
     const [accountToDelete, setAccountToDelete] = useState<number | null>(null);
     const [loginError, setLoginError] = useState<string | null>(null);
+    const [tokenAccount, setTokenAccount] = useState<PlexAccount | null>(null);
+    const [tokenForm, setTokenForm] = useState({ password: '', code: '' });
+    const [tokenError, setTokenError] = useState<string | null>(null);
+    const [tokenLoading, setTokenLoading] = useState(false);
+    const { toast } = useToast();
     const [formData, setFormData] = useState<PlexAccountForm>({
         name: '',
         username: '',
@@ -91,6 +104,54 @@ export default function PlexAccounts() {
             setLoginError(message);
         } finally {
             setLoading(false);
+        }
+    };
+
+    const startTokenRefresh = (account: PlexAccount) => {
+        setTokenAccount(account);
+        setTokenForm({ password: '', code: '' });
+        setTokenError(null);
+    };
+
+    const closeTokenRefresh = () => {
+        setTokenAccount(null);
+        setTokenForm({ password: '', code: '' });
+        setTokenError(null);
+    };
+
+    /**
+     * Renew the stored Plex.tv token of an existing account
+     *
+     * @description Plex.tv revokes tokens on a password change or when the
+     * device is removed from the authorized list. Renewing in place keeps the
+     * servers, libraries, caches and schedules that deleting the account would
+     * destroy. The backend also re-syncs the server URIs, since a stale token
+     * is exactly what blocks that refresh.
+     */
+    const handleTokenRefresh = async () => {
+        if (!tokenAccount) return;
+
+        setTokenLoading(true);
+        setTokenError(null);
+        try {
+            const res = await api.put<TokenRefreshResponse>(
+                `/plex/accounts/${tokenAccount.id}/token`,
+                { password: tokenForm.password, code: tokenForm.code || null }
+            );
+
+            if (res.data.unreachable?.length) {
+                toast.warning(res.data.message);
+            } else {
+                toast.success(res.data.message);
+            }
+            closeTokenRefresh();
+            await fetchData();
+        } catch (error: any) {
+            console.error("Failed to renew Plex token", error);
+            const message = error.response?.data?.detail || "Failed to renew the Plex.tv token";
+            setTokenError(message);
+        } finally {
+            setTokenLoading(false);
         }
     };
 
@@ -210,6 +271,15 @@ export default function PlexAccounts() {
                                         <td className="p-3">
                                             <div className="flex gap-2 justify-end">
                                                 <Button
+                                                    onClick={() => startTokenRefresh(account)}
+                                                    disabled={loading || isAdding}
+                                                    size="sm"
+                                                    variant="outline"
+                                                    title="Renew Plex.tv token"
+                                                >
+                                                    <KeyRound className="w-4 h-4" />
+                                                </Button>
+                                                <Button
                                                     onClick={() => confirmDelete(account.id)}
                                                     disabled={loading || isAdding}
                                                     size="sm"
@@ -251,6 +321,61 @@ export default function PlexAccounts() {
                     </div>
                 </CardContent>
             </Card>
+
+            {/* Token Renewal Dialog */}
+            <Dialog
+                isOpen={!!tokenAccount}
+                onClose={closeTokenRefresh}
+                title="Renew Plex.tv Token"
+            >
+                <div className="space-y-4">
+                    <p className="text-sm text-muted-foreground">
+                        Re-authenticate <strong>{tokenAccount?.username}</strong> to store a fresh
+                        token. Your servers, libraries and schedules are kept.
+                    </p>
+                    <div className="space-y-2">
+                        <Input
+                            name="password"
+                            type="password"
+                            value={tokenForm.password}
+                            onChange={(e) => {
+                                setTokenForm(prev => ({ ...prev, password: e.target.value }));
+                                setTokenError(null);
+                            }}
+                            placeholder="Plex.tv password"
+                            autoFocus
+                        />
+                        <Input
+                            name="code"
+                            value={tokenForm.code}
+                            onChange={(e) => {
+                                setTokenForm(prev => ({ ...prev, code: e.target.value }));
+                                setTokenError(null);
+                            }}
+                            placeholder="Two-factor code (leave empty if unused)"
+                        />
+                    </div>
+                    {tokenError && (
+                        <p className="text-xs text-red-500">{tokenError}</p>
+                    )}
+                    <div className="flex justify-end gap-2">
+                        <Button variant="outline" onClick={closeTokenRefresh} disabled={tokenLoading}>
+                            Cancel
+                        </Button>
+                        <Button
+                            onClick={handleTokenRefresh}
+                            disabled={tokenLoading || !tokenForm.password}
+                        >
+                            {tokenLoading ? (
+                                <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                            ) : (
+                                <KeyRound className="w-4 h-4 mr-2" />
+                            )}
+                            Renew Token
+                        </Button>
+                    </div>
+                </div>
+            </Dialog>
 
             {/* Delete Confirmation Dialog */}
             <Dialog

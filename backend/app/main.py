@@ -8,7 +8,18 @@ from app.api.api import api_router
 from app.core.config import settings
 from app.db.base import Base
 from app.db.session import engine
+import logging
 import os
+
+
+# Uvicorn only configures its own loggers, so without an explicit root handler
+# every "app.*" record falls back to logging.lastResort (level WARNING) and all
+# INFO/DEBUG output is silently discarded.
+logging.basicConfig(
+    level=settings.LOG_LEVEL.upper(),
+    format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+    force=True,
+)
 
 
 @asynccontextmanager

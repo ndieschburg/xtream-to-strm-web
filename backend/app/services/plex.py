@@ -13,11 +13,120 @@ and media streaming URL generation.
         client = PlexClient(result["auth_token"])
         servers = client.get_servers()
 """
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential
+import httpx
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class PlexAuthError(Exception):
+    """
+    Raised when Plex.tv rejects the stored account token.
+
+    @description Tokens are revoked by a password change or by removing the
+    device from the authorized list on plex.tv. Callers must surface this to
+    the user instead of silently returning an empty result.
+    """
+
+
+class PlexApiError(Exception):
+    """Raised when a Plex.tv request fails for any reason other than auth."""
+
+
+# A probe must be quick: several connections are tried in sequence
+_PROBE_TIMEOUT = httpx.Timeout(6.0, connect=4.0)
+
+
+def _connection_preference(connection) -> Tuple[int, int]:
+    """
+    Sort key ordering a server's connections from best to worst.
+
+    @description A LAN address is fastest and avoids NAT hairpinning issues, a
+    direct WAN address still gives full bandwidth, and the Plex relay comes last
+    because Plex caps its throughput.
+
+    @param connection Connection entry of a MyPlexResource
+    @returns Tuple usable as a `sorted` key: local first, relay last
+    """
+    return (
+        0 if getattr(connection, "local", False) else 1,
+        1 if getattr(connection, "relay", False) else 0,
+    )
+
+
+def _connection_answers(uri: str, access_token: str, machine_id: str) -> bool:
+    """
+    Check that a connection really serves the expected Plex server.
+
+    @description The machine identifier is verified because a LAN address
+    advertised by a remote server may resolve to an unrelated device on the
+    caller's own network, which would otherwise look like a valid server.
+
+    @param uri Candidate connection URI
+    @param access_token Server-specific access token
+    @param machine_id Expected Plex machine identifier
+    @returns True when the endpoint answers and identifies as `machine_id`
+    """
+    try:
+        response = httpx.get(
+            f"{uri}/identity",
+            headers={"X-Plex-Token": access_token},
+            timeout=_PROBE_TIMEOUT,
+        )
+    except Exception as e:
+        logger.debug(f"Probe failed for {uri}: {type(e).__name__}")
+        return False
+
+    if response.status_code != 200:
+        logger.debug(f"Probe for {uri} returned HTTP {response.status_code}")
+        return False
+
+    if machine_id not in response.text:
+        logger.warning(f"{uri} answered but is a different Plex server")
+        return False
+
+    return True
+
+
+def select_connection(resource) -> Tuple[Optional[str], bool]:
+    """
+    Pick the best reachable connection URI for a Plex server.
+
+    @description Candidates are probed from the closest to the most constrained,
+    so an address that Plex.tv still advertises but that no longer answers is
+    never stored. When nothing answers, the preferred candidate is returned with
+    reachable=False so the caller can report the server as unreachable rather
+    than lose its URI.
+
+    @param resource MyPlexResource describing the server
+    @returns Tuple (uri, reachable); uri is None when no connection is advertised
+
+    @example
+    uri, reachable = select_connection(resource)
+    if not reachable:
+        logger.warning(f"{resource.name} is unreachable")
+    """
+    candidates = sorted(resource.connections, key=_connection_preference)
+    if not candidates:
+        logger.warning(f"Plex server '{resource.name}' advertises no connection")
+        return None, False
+
+    for connection in candidates:
+        if _connection_answers(connection.uri, resource.accessToken, resource.clientIdentifier):
+            logger.info(
+                f"Selected connection for '{resource.name}': {connection.uri} "
+                f"(local={getattr(connection, 'local', '?')}, "
+                f"relay={getattr(connection, 'relay', '?')})"
+            )
+            return connection.uri, True
+
+    logger.warning(
+        f"No reachable connection for '{resource.name}' "
+        f"({len(candidates)} candidate(s) probed)"
+    )
+    return candidates[0].uri, False
 
 
 class PlexClient:
@@ -51,17 +160,23 @@ class PlexClient:
                 raise ImportError("plexapi library not installed. Run: pip install plexapi")
 
     @classmethod
-    def login(cls, username: str, password: str) -> Dict[str, Any]:
+    def login(cls, username: str, password: str, code: Optional[str] = None) -> Dict[str, Any]:
         """
         Authenticate with Plex.tv and return account info + auth token.
 
         @param username Plex.tv email or username
         @param password Plex.tv password
+        @param code Two-factor authentication code, when the account requires one
         @returns Dict with success, auth_token, username, email, uuid, message
+
+        @example
+        result = PlexClient.login("me@example.com", "secret", code="123456")
+        if result["success"]:
+            store(result["auth_token"])
         """
         try:
             from plexapi.myplex import MyPlexAccount
-            account = MyPlexAccount(username, password)
+            account = MyPlexAccount(username, password, code=code)
             return {
                 "success": True,
                 "auth_token": account.authenticationToken,
@@ -92,37 +207,57 @@ class PlexClient:
 
     def get_servers(self) -> List[Dict[str, Any]]:
         """
-        Get list of available Plex servers.
+        Get available Plex servers, each with a connection URI that answers.
 
-        @returns List of server dicts with server_id, name, uri, access_token, etc.
+        @description Every advertised connection is probed, so a stale address
+        is never reported as usable. Failures are raised instead of swallowed:
+        returning an empty list made a revoked token look like "no servers", and
+        callers reported success while updating nothing.
+
+        @returns List of dicts with server_id, name, uri, uri_reachable,
+        access_token, version and is_owned
+        @raises PlexAuthError When Plex.tv rejects the account token
+        @raises PlexApiError When the Plex.tv request fails for another reason
+
+        @example
+        try:
+            servers = PlexClient(token).get_servers()
+        except PlexAuthError:
+            prompt_user_to_renew_token()
         """
         try:
             resources = self.account.resources()
-            servers = []
-            for resource in resources:
-                if resource.product == "Plex Media Server":
-                    # Get best connection (prefer local, then remote)
-                    connection = None
-                    for conn in resource.connections:
-                        if not conn.local:  # Prefer remote for external access
-                            connection = conn
-                            break
-                    if not connection and resource.connections:
-                        connection = resource.connections[0]
-
-                    if connection:
-                        servers.append({
-                            "server_id": resource.clientIdentifier,
-                            "name": resource.name,
-                            "uri": connection.uri,
-                            "access_token": resource.accessToken,
-                            "version": resource.productVersion,
-                            "is_owned": resource.owned,
-                        })
-            return servers
         except Exception as e:
-            logger.error(f"Failed to get Plex servers: {e}")
-            return []
+            message = str(e)
+            if "401" in message or "unauthorized" in message.lower():
+                logger.error(f"Plex.tv rejected the account token: {message}")
+                raise PlexAuthError(
+                    "Plex.tv rejected the stored token. Renew the account token."
+                ) from e
+
+            logger.error(f"Plex.tv request failed: {type(e).__name__}: {message}")
+            raise PlexApiError(f"Plex.tv request failed: {type(e).__name__}") from e
+
+        servers = []
+        for resource in resources:
+            if resource.product != "Plex Media Server":
+                continue
+
+            uri, reachable = select_connection(resource)
+            if uri is None:
+                continue
+
+            servers.append({
+                "server_id": resource.clientIdentifier,
+                "name": resource.name,
+                "uri": uri,
+                "uri_reachable": reachable,
+                "access_token": resource.accessToken,
+                "version": resource.productVersion,
+                "is_owned": resource.owned,
+            })
+
+        return servers
 
     def connect_server(self, uri: str, access_token: str):
         """

@@ -381,6 +381,27 @@ class PlexLoginRequest(BaseModel):
     """Request to test Plex.tv login credentials."""
     username: str
     password: str
+    code: Optional[str] = None  # Two-factor code, when the account requires one
+
+
+class PlexAccountTokenRefresh(BaseModel):
+    """
+    Request to renew the stored Plex.tv token of an existing account.
+
+    @description Only the password is needed: the username is already stored,
+    and renewing in place avoids deleting the account, which would cascade to
+    its servers, libraries, caches and schedules.
+    """
+    password: str
+    code: Optional[str] = None
+
+
+class PlexTokenRefreshResponse(BaseModel):
+    """Result of a Plex.tv token renewal and the server refresh that follows."""
+    success: bool
+    message: str
+    servers_refreshed: int = 0
+    unreachable: List[str] = []
 
 
 class PlexLoginResponse(BaseModel):

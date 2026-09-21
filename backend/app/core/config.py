@@ -29,7 +29,10 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8 # 8 days
     ADMIN_USER: str = "admin"
     ADMIN_PASS: str = "admin"
-    
+
+    # Logging - set to DEBUG to trace HLS segment requests
+    LOG_LEVEL: str = "INFO"
+
     class Config:
         env_file = ".env"
 
