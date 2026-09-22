@@ -32,6 +32,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def normalize_year(year):
+    """
+    Year as it is stored in cache: a string, or None when Plex has none.
+
+    Both sides of a change detection must go through this, otherwise a movie
+    without a year compares None against "None" and looks changed forever.
+    """
+    return str(year) if year else None
+
+
 def build_plex_folder_name(fm: FileManager, title: str, year, tmdb_id) -> str:
     """Folder name of a Plex movie or show, shared by creation and cleanup"""
     safe_title = fm.sanitize_name(title or "Unknown")
@@ -317,7 +327,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
                             pass
 
                     if (cached.title != movie.get("title") or
-                        cached.year != str(movie.get("year", "")) or
+                        cached.year != normalize_year(movie.get("year")) or
                         cached_tmdb != new_tmdb):
                         to_add_update.append(movie)
 
@@ -385,7 +395,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
                         db.add(cached)
 
                     cached.title = title
-                    cached.year = str(year) if year else None
+                    cached.year = normalize_year(year)
                     cached.guid = str(guid)
                     cached.updated_at = movie.get("updated_at")
 
@@ -680,7 +690,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                         cached_series[show["key"]] = cached
 
                     cached.title = title
-                    cached.year = str(year) if year else None
+                    cached.year = normalize_year(year)
                     cached.guid = str(guid)
                     cached.updated_at = show_updated_at
                     cached.leaf_count = show_leaf_count
