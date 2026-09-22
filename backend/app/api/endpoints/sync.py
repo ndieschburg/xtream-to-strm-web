@@ -22,6 +22,7 @@ def get_sync_status(db: Session = Depends(get_db)):
             last_sync=state.last_sync,
             items_added=state.items_added,
             items_deleted=state.items_deleted,
+            files_written=state.files_written or 0,
             error_message=state.error_message
         ) for state in states
     ]

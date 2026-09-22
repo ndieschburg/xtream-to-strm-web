@@ -36,6 +36,7 @@ interface SyncStatus {
     status: string;
     items_added: number;
     items_deleted: number;
+    files_written: number;
     error_message: string | null;
 }
 
@@ -370,8 +371,12 @@ export default function PlexSelection() {
                                     ))}
                                 </div>
                                 {moviesStatus && (moviesStatus.items_added > 0 || moviesStatus.items_deleted > 0) && (
-                                    <div className="mt-4 text-sm text-muted-foreground">
-                                        Last sync: +{moviesStatus.items_added} added, -{moviesStatus.items_deleted} deleted
+                                    <div
+                                        className="mt-4 text-sm text-muted-foreground"
+                                        title="STRM files actually written to disk, an unchanged file is left untouched"
+                                    >
+                                        Last sync: +{moviesStatus.items_added} movies added, -{moviesStatus.items_deleted} removed, 
+                                        {moviesStatus.files_written || 0} STRM written
                                     </div>
                                 )}
                             </CardContent>
@@ -441,8 +446,12 @@ export default function PlexSelection() {
                                     ))}
                                 </div>
                                 {seriesStatus && (seriesStatus.items_added > 0 || seriesStatus.items_deleted > 0) && (
-                                    <div className="mt-4 text-sm text-muted-foreground">
-                                        Last sync: +{seriesStatus.items_added} added, -{seriesStatus.items_deleted} deleted
+                                    <div
+                                        className="mt-4 text-sm text-muted-foreground"
+                                        title="STRM files actually written to disk, an unchanged file is left untouched"
+                                    >
+                                        Last sync: +{seriesStatus.items_added} episodes added, -{seriesStatus.items_deleted} removed, 
+                                        {seriesStatus.files_written || 0} STRM written
                                     </div>
                                 )}
                             </CardContent>

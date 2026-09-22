@@ -54,6 +54,7 @@ class SyncStatusResponse(BaseModel):
     status: str
     items_added: int
     items_deleted: int
+    files_written: int = 0
     error_message: Optional[str] = None
 
 class M3USyncStatusResponse(BaseModel):
@@ -64,6 +65,7 @@ class M3USyncStatusResponse(BaseModel):
     status: str
     items_added: int
     items_deleted: int
+    files_written: int = 0
     error_message: Optional[str] = None
 
 class SyncTriggerResponse(BaseModel):
@@ -497,6 +499,7 @@ class PlexSyncStatusResponse(BaseModel):
     status: str
     items_added: int
     items_deleted: int
+    files_written: int = 0
     error_message: Optional[str] = None
     task_id: Optional[str] = None
 

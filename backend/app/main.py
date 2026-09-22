@@ -200,15 +200,17 @@ def _ensure_schema_up_to_date():
                         except Exception as e:
                             print(f"  ⚠️ Could not add {col_name}: {e}")
 
-        # 7. Check execution tables sync counters (added/deleted/files written)
-        # Runs last: steps 4 and 5 may have recreated those tables without them
+        # 7. Check the sync counters (added/deleted/files written) of the
+        # execution and state tables. Runs last: steps 4 and 5 may have
+        # recreated the execution tables without them
         exec_counter_cols = [
             ("items_added", "INTEGER DEFAULT 0"),
             ("items_deleted", "INTEGER DEFAULT 0"),
-            ("files_written", "INTEGER DEFAULT 0"),
+            ("files_written", "INTEGER NOT NULL DEFAULT 0"),
         ]
         fresh_inspector = inspect(engine)
-        for table in ("schedule_executions", "plex_schedule_executions"):
+        for table in ("schedule_executions", "plex_schedule_executions",
+                      "sync_state", "plex_sync_state"):
             if table not in fresh_inspector.get_table_names():
                 continue
             table_cols = [c['name'] for c in fresh_inspector.get_columns(table)]

@@ -322,6 +322,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
 
         sync_state.items_added = len(to_add_update)
         sync_state.items_deleted = len(to_delete)
+        sync_state.files_written = strm_written
         sync_state.status = SyncStatus.SUCCESS
         db.commit()
 
@@ -644,6 +645,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
 
         sync_state.items_added = total_episodes_added
         sync_state.items_deleted = episodes_deleted
+        sync_state.files_written = strm_written
         sync_state.status = SyncStatus.SUCCESS
         db.commit()
 

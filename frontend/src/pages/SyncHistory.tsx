@@ -258,10 +258,11 @@ export default function SyncHistory() {
                                         <th className="p-3 text-left">Source</th>
                                         <th className="p-3 text-left">Type</th>
                                         <th className="p-3 text-left">Started</th>
-                                        <th className="p-3 text-left">Completed</th>
                                         <th className="p-3 text-left">Duration</th>
                                         <th className="p-3 text-left">Status</th>
-                                        <th className="p-3 text-right">Changes</th>
+                                        <th className="p-3 text-right">Added</th>
+                                        <th className="p-3 text-right">Deleted</th>
+                                        <th className="p-3 text-right">STRM written</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y">
@@ -279,36 +280,48 @@ export default function SyncHistory() {
                                             <td className="p-3 whitespace-nowrap">
                                                 {formatDateTime(item.started_at)}
                                             </td>
-                                            <td className="p-3 whitespace-nowrap">
-                                                {item.completed_at ? formatDateTime(item.completed_at) : '-'}
-                                            </td>
                                             <td className="p-3">
                                                 {formatDuration(item.duration_seconds)}
                                             </td>
                                             <td className="p-3">
                                                 {getStatusBadge(item.status)}
                                             </td>
-                                            <td className="p-3 text-right font-medium">
-                                                {item.has_details ? (
-                                                    <div
-                                                        className="flex flex-col items-end"
-                                                        title={`${item.items_added} ${item.item_unit} added or updated, ${item.items_deleted} deleted - ${item.files_written} STRM files written to disk`}
+                                            {item.has_details ? (
+                                                <>
+                                                    <td
+                                                        className="p-3 text-right font-medium"
+                                                        title={`${item.items_added} ${item.item_unit} added or updated`}
                                                     >
-                                                        <span>
-                                                            <span className="text-green-600">+{item.items_added}</span>
-                                                            <span className="text-muted-foreground"> / </span>
-                                                            <span className="text-red-600">-{item.items_deleted}</span>
+                                                        <span className={item.items_added > 0 ? 'text-green-600' : 'text-muted-foreground'}>
+                                                            {item.items_added > 0 ? `+${item.items_added}` : '0'}
                                                         </span>
-                                                        <span className="text-xs font-normal text-muted-foreground">
-                                                            {item.item_unit} - {item.files_written} strm
+                                                    </td>
+                                                    <td
+                                                        className="p-3 text-right font-medium"
+                                                        title={`${item.items_deleted} ${item.item_unit} removed`}
+                                                    >
+                                                        <span className={item.items_deleted > 0 ? 'text-red-600' : 'text-muted-foreground'}>
+                                                            {item.items_deleted > 0 ? `-${item.items_deleted}` : '0'}
                                                         </span>
-                                                    </div>
-                                                ) : item.items_total > 0 ? (
-                                                    <span title="Older run: additions and deletions were not stored separately">
-                                                        {item.items_total}
-                                                    </span>
-                                                ) : '-'}
-                                            </td>
+                                                    </td>
+                                                    <td
+                                                        className="p-3 text-right font-medium"
+                                                        title="STRM files actually written to disk, an unchanged file is left untouched"
+                                                    >
+                                                        <span className={item.files_written > 0 ? '' : 'text-muted-foreground'}>
+                                                            {item.files_written}
+                                                        </span>
+                                                    </td>
+                                                </>
+                                            ) : (
+                                                <td
+                                                    colSpan={3}
+                                                    className="p-3 text-right text-muted-foreground"
+                                                    title="Older run: only a combined total was recorded"
+                                                >
+                                                    {item.items_total > 0 ? `${item.items_total} (combined)` : '-'}
+                                                </td>
+                                            )}
                                         </tr>
                                     ))}
                                 </tbody>

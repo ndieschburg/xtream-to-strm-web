@@ -21,7 +21,9 @@ class SyncState(Base):
     type = Column(String, nullable=False)  # movies or series
     last_sync = Column(DateTime, nullable=True)
     status = Column(String, nullable=False, default=SyncStatus.IDLE)
+    # Unit is the STRM file: movies for a "movies" sync, episodes for a "series" sync
     items_added = Column(Integer, nullable=False, default=0)
     items_deleted = Column(Integer, nullable=False, default=0)
+    files_written = Column(Integer, nullable=False, default=0)  # STRM files actually written
     error_message = Column(String, nullable=True)
     task_id = Column(String, nullable=True)  # Celery task ID for cancellation

@@ -26,6 +26,7 @@ interface SyncStatus {
     status: string;
     items_added: number;
     items_deleted: number;
+    files_written: number;
     error_message?: string;
 }
 
@@ -349,14 +350,20 @@ export default function XTVSelection() {
                                     )}
                                     {getStatus(selectedSubId, 'movies')?.items_added !== undefined && (
                                         <div className="flex justify-between">
-                                            <span className="text-muted-foreground">Added:</span>
-                                            <span className="font-medium text-green-600">{getStatus(selectedSubId, 'movies')?.items_added || 0}</span>
+                                            <span className="text-muted-foreground">Movies added:</span>
+                                            <span className="font-medium text-green-600">+{getStatus(selectedSubId, 'movies')?.items_added || 0}</span>
                                         </div>
                                     )}
                                     {getStatus(selectedSubId, 'movies')?.items_deleted !== undefined && (
                                         <div className="flex justify-between">
-                                            <span className="text-muted-foreground">Deleted:</span>
-                                            <span className="font-medium text-red-600">{getStatus(selectedSubId, 'movies')?.items_deleted || 0}</span>
+                                            <span className="text-muted-foreground">Movies removed:</span>
+                                            <span className="font-medium text-red-600">-{getStatus(selectedSubId, 'movies')?.items_deleted || 0}</span>
+                                        </div>
+                                    )}
+                                    {getStatus(selectedSubId, 'movies')?.files_written !== undefined && (
+                                        <div className="flex justify-between" title="STRM files actually written to disk, an unchanged file is left untouched">
+                                            <span className="text-muted-foreground">STRM written:</span>
+                                            <span className="font-medium">{getStatus(selectedSubId, 'movies')?.files_written || 0}</span>
                                         </div>
                                     )}
                                 </div>
@@ -408,14 +415,20 @@ export default function XTVSelection() {
                                     )}
                                     {getStatus(selectedSubId, 'series')?.items_added !== undefined && (
                                         <div className="flex justify-between">
-                                            <span className="text-muted-foreground">Added:</span>
-                                            <span className="font-medium text-green-600">{getStatus(selectedSubId, 'series')?.items_added || 0}</span>
+                                            <span className="text-muted-foreground">Episodes added:</span>
+                                            <span className="font-medium text-green-600">+{getStatus(selectedSubId, 'series')?.items_added || 0}</span>
                                         </div>
                                     )}
                                     {getStatus(selectedSubId, 'series')?.items_deleted !== undefined && (
                                         <div className="flex justify-between">
-                                            <span className="text-muted-foreground">Deleted:</span>
-                                            <span className="font-medium text-red-600">{getStatus(selectedSubId, 'series')?.items_deleted || 0}</span>
+                                            <span className="text-muted-foreground">Episodes removed:</span>
+                                            <span className="font-medium text-red-600">-{getStatus(selectedSubId, 'series')?.items_deleted || 0}</span>
+                                        </div>
+                                    )}
+                                    {getStatus(selectedSubId, 'series')?.files_written !== undefined && (
+                                        <div className="flex justify-between" title="STRM files actually written to disk, an unchanged file is left untouched">
+                                            <span className="text-muted-foreground">STRM written:</span>
+                                            <span className="font-medium">{getStatus(selectedSubId, 'series')?.files_written || 0}</span>
                                         </div>
                                     )}
                                 </div>

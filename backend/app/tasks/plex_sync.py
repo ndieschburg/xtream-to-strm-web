@@ -279,6 +279,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
             sync_state.status = "success"
             sync_state.items_added = 0
             sync_state.items_deleted = 0
+            sync_state.files_written = 0
             db.commit()
             return {"items_added": 0, "items_deleted": 0, "files_written": 0}
 
@@ -418,6 +419,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
 
         sync_state.items_added = total_added
         sync_state.items_deleted = total_deleted
+        sync_state.files_written = strm_written
         sync_state.status = "success"
         db.commit()
 
@@ -478,6 +480,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             sync_state.status = "success"
             sync_state.items_added = 0
             sync_state.items_deleted = 0
+            sync_state.files_written = 0
             db.commit()
             return {"items_added": 0, "items_deleted": 0, "files_written": 0}
 
@@ -715,6 +718,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
 
         sync_state.items_added = total_episodes_added
         sync_state.items_deleted = total_episodes_deleted
+        sync_state.files_written = strm_written
         sync_state.status = "success"
         db.commit()
 
