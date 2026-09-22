@@ -9,8 +9,10 @@ Syncs movies and series from Plex servers to STRM/NFO files.
 - Generates STRM and NFO files using FileManager
 """
 import asyncio
+import ast
 import os
 import shutil
+from collections import defaultdict
 from app.core.celery_app import celery_app
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
@@ -28,6 +30,39 @@ from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def build_plex_folder_name(fm: FileManager, title: str, year, tmdb_id) -> str:
+    """Folder name of a Plex movie or show, shared by creation and cleanup"""
+    safe_title = fm.sanitize_name(title or "Unknown")
+
+    if tmdb_id:
+        return f"{safe_title} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{safe_title} {{tmdb-{tmdb_id}}}"
+
+    return f"{safe_title} ({year})" if year else safe_title
+
+
+def cached_item_dir(fm: FileManager, cached_item, library, use_library_folders: bool) -> str:
+    """
+    Rebuild the directory of an already synced item from its cache row.
+
+    The cache stores the GUID dict as a string, hence the literal_eval.
+    """
+    tmdb_id = None
+    if cached_item.guid:
+        try:
+            guid = ast.literal_eval(cached_item.guid)
+            if isinstance(guid, dict):
+                tmdb_id = guid.get("tmdb")
+        except (ValueError, SyntaxError):
+            logger.warning(f"Unreadable cached GUID for {cached_item.title}: {cached_item.guid}")
+
+    folder_name = build_plex_folder_name(fm, cached_item.title, cached_item.year, tmdb_id)
+
+    if use_library_folders and library is not None:
+        return os.path.join(fm.output_dir, fm.sanitize_name(library.title), folder_name)
+
+    return os.path.join(fm.output_dir, folder_name)
 
 
 def generate_plex_movie_nfo(movie: dict, fm: FileManager) -> str:
@@ -289,14 +324,15 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
             # Detect deletions
             to_delete = [c for k, c in cached_movies.items() if k not in current_keys]
 
-            # Process deletions
+            # Process deletions: the movie is gone from Plex, drop its folder
             for cached_movie in to_delete:
-                # Try to remove files (best effort)
+                movie_dir = cached_item_dir(fm, cached_movie, library, use_library_folders)
                 try:
-                    # We don't have full path info in cache, so just delete from DB
-                    pass
-                except Exception:
-                    pass
+                    if os.path.isdir(movie_dir):
+                        shutil.rmtree(movie_dir)
+                except OSError as e:
+                    logger.warning(f"Could not remove {movie_dir}: {e}")
+
                 db.delete(cached_movie)
                 total_deleted += 1
 
@@ -310,13 +346,8 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
 
                     title = movie.get("title", "Unknown")
                     year = movie.get("year", "")
-                    safe_title = fm.sanitize_name(title)
 
-                    # Build folder name
-                    if tmdb_id:
-                        folder_name = f"{safe_title} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{safe_title} {{tmdb-{tmdb_id}}}"
-                    else:
-                        folder_name = f"{safe_title} ({year})" if year else safe_title
+                    folder_name = build_plex_folder_name(fm, title, year, tmdb_id)
 
                     # Determine target directory
                     if use_library_folders:
@@ -447,6 +478,11 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
         ).all()
         cached_episodes = {e.plex_key: e for e in all_cached_episodes}
 
+        # Same rows indexed per show, to spot the episodes that vanished
+        cached_eps_by_show = defaultdict(dict)
+        for cached_ep in all_cached_episodes:
+            cached_eps_by_show[cached_ep.series_key][cached_ep.plex_key] = cached_ep
+
         # Counters are episode-based here, one STRM file per episode
         total_episodes_added = 0
         total_episodes_skipped = 0
@@ -476,8 +512,15 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             # Detect deletions
             to_delete = [c for k, c in cached_series.items() if k not in current_keys]
 
-            # Process deletions
+            # Process deletions: the show is gone from Plex, drop its folder
             for cached_show in to_delete:
+                show_dir = cached_item_dir(fm, cached_show, library, use_library_folders)
+                try:
+                    if os.path.isdir(show_dir):
+                        shutil.rmtree(show_dir)
+                except OSError as e:
+                    logger.warning(f"Could not remove {show_dir}: {e}")
+
                 db.delete(cached_show)
                 # Also delete episodes
                 total_episodes_deleted += db.query(PlexEpisodeCache).filter(
@@ -496,13 +539,8 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
 
                     title = show.get("title", "Unknown")
                     year = show.get("year", "")
-                    safe_title = fm.sanitize_name(title)
 
-                    # Build folder name
-                    if tmdb_id:
-                        folder_name = f"{safe_title} ({year}) {{tmdb-{tmdb_id}}}" if year else f"{safe_title} {{tmdb-{tmdb_id}}}"
-                    else:
-                        folder_name = f"{safe_title} ({year})" if year else safe_title
+                    folder_name = build_plex_folder_name(fm, title, year, tmdb_id)
 
                     # Determine target directory
                     if use_library_folders:
@@ -537,6 +575,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                     else:
                         # Fetch episodes
                         episodes_by_season = client.get_show_episodes(plex_server, show["key"])
+                        current_ep_keys = set()
 
                         for season_num, episodes in episodes_by_season.items():
                             # Season folder
@@ -552,6 +591,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                                 ep_title = episode.get("title", "")
                                 ep_plex_key = episode.get("key")
                                 ep_rating_key = episode.get("rating_key")
+                                current_ep_keys.add(ep_plex_key)
 
                                 # Check episode cache - skip if unchanged
                                 cached_ep = cached_episodes.get(ep_plex_key)
@@ -568,12 +608,9 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                                 total_episodes_added += 1
 
                                 # Format episode filename
-                                formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
-                                if ep_title:
-                                    safe_ep_title = fm.sanitize_name(ep_title)
-                                    filename = f"{formatted_ep} - {safe_ep_title}"
-                                else:
-                                    filename = formatted_ep
+                                filename = fm.build_episode_filename(
+                                    "", season_num, ep_num, ep_title
+                                )
 
                                 # Build proxy URL for streaming
                                 key_param = f"?key={shared_key}" if shared_key else ""
@@ -602,6 +639,34 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                                 cached_ep.season_num = season_num
                                 cached_ep.episode_num = ep_num
                                 cached_ep.title = ep_title
+
+                        # Episodes that vanished from Plex: drop their files.
+                        # An empty fetch is treated as a glitch, not as a show
+                        # losing every episode, so nothing is removed then.
+                        stale_candidates = cached_eps_by_show.get(show["key"], {}) if current_ep_keys else {}
+
+                        for stale_key, stale_ep in list(stale_candidates.items()):
+                            if stale_key in current_ep_keys:
+                                continue
+
+                            stale_season = stale_ep.season_num or 0
+                            if use_season_folders:
+                                stale_dir = os.path.join(series_dir, f"Season {stale_season:02d}")
+                            else:
+                                stale_dir = series_dir
+
+                            stale_filename = fm.build_episode_filename(
+                                "", stale_season, stale_ep.episode_num or 0, stale_ep.title
+                            )
+
+                            await fm.delete_file(os.path.join(stale_dir, f"{stale_filename}.strm"))
+                            await fm.delete_file(os.path.join(stale_dir, f"{stale_filename}.nfo"))
+                            await fm.delete_directory_if_empty(stale_dir)
+
+                            cached_episodes.pop(stale_key, None)
+                            cached_eps_by_show[show["key"]].pop(stale_key, None)
+                            db.delete(stale_ep)
+                            total_episodes_deleted += 1
 
                     # Update series cache
                     cached = cached_series.get(show["key"])
@@ -634,7 +699,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             f"Plex series sync: {total_episodes_added} episodes added/updated, "
             f"{total_episodes_skipped} skipped (unchanged), "
             f"{total_series_skipped} shows skipped without an API call, "
-            f"{total_episodes_deleted} deleted with {total_series_deleted} shows, "
+            f"{total_episodes_deleted} episodes deleted ({total_series_deleted} shows removed), "
             f"{strm_written} STRM files written"
         )
 

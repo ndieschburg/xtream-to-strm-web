@@ -544,10 +544,12 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                                 'container_extension': container
                             })
 
-                    # Episodes that vanished from the panel: drop their files
+                    # Episodes that vanished from the panel: drop their files.
+                    # An empty listing is far more likely a panel glitch than a
+                    # series losing every episode, so nothing is removed then.
                     deleted_ep_ids = []
 
-                    for stale_id, stale_ep in cached_eps_by_series.get(series_id, {}).items():
+                    for stale_id, stale_ep in (cached_eps_by_series.get(series_id, {}) if current_ep_ids else {}).items():
                         if stale_id in current_ep_ids:
                             continue
 
@@ -636,7 +638,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
         logger.info(
             f"Series sync: {total_episodes_added} episodes added/updated, "
             f"{total_episodes_skipped} skipped (unchanged), "
-            f"{episodes_deleted} deleted with {len(to_delete)} series, "
+            f"{episodes_deleted} episodes deleted ({len(to_delete)} series removed), "
             f"{strm_written} STRM files written"
         )
 
