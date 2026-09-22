@@ -56,18 +56,23 @@ def _counters(exec_row) -> dict:
     Read the counters of an execution.
 
     Executions recorded before the split counters only have items_processed,
-    which lumped additions and deletions together.
+    which lumped additions and deletions together. They are recognisable by a
+    non-zero total with nothing behind it; a run where nothing changed has a
+    zero total and keeps its detailed zeros.
     """
     added = exec_row.items_added or 0
     deleted = exec_row.items_deleted or 0
-    has_details = bool(added or deleted or exec_row.files_written)
+    written = exec_row.files_written or 0
+    processed = exec_row.items_processed or 0
+
+    legacy = processed > 0 and not (added or deleted or written)
 
     return {
         "items_added": added,
         "items_deleted": deleted,
-        "items_total": (added + deleted) if has_details else (exec_row.items_processed or 0),
-        "files_written": exec_row.files_written or 0,
-        "has_details": has_details,
+        "items_total": processed if legacy else (added + deleted),
+        "files_written": written,
+        "has_details": not legacy,
     }
 
 
