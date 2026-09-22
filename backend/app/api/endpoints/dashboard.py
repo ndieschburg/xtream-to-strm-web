@@ -28,7 +28,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
     """Get overall dashboard statistics"""
     
     # Source statistics
-    xtream_total = db.query(Subscription).count()
+    xtream_subs_total = db.query(Subscription).count()
     xtream_active = db.query(Subscription).filter(Subscription.is_active == True).count()
 
     m3u_total = db.query(M3USource).count()
@@ -77,7 +77,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
     errors_24h = xtream_errors + plex_errors
 
     # Success rate (last 24h) from execution tables
-    xtream_total = db.query(ScheduleExecution).filter(
+    xtream_completed = db.query(ScheduleExecution).filter(
         ScheduleExecution.started_at >= yesterday,
         ScheduleExecution.status != ExecutionStatus.RUNNING
     ).count()
@@ -94,7 +94,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
         PlexScheduleExecution.started_at >= yesterday
     ).count()
 
-    total_completed = xtream_total + plex_total
+    total_completed = xtream_completed + plex_total
     total_success = xtream_success + plex_success
     success_rate = (total_success / total_completed * 100) if total_completed > 0 else 100
 
@@ -149,12 +149,12 @@ def get_dashboard_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
     return {
         "sources": {
-            "total": xtream_total + m3u_total + plex_servers_total,
-            "xtream": xtream_total,
+            "total": xtream_subs_total + m3u_total + plex_servers_total,
+            "xtream": xtream_subs_total,
             "m3u": m3u_total,
             "plex": plex_servers_total,
             "active": xtream_active + m3u_active + plex_servers_active,
-            "inactive": (xtream_total - xtream_active) + (m3u_total - m3u_active) + (plex_servers_total - plex_servers_active)
+            "inactive": (xtream_subs_total - xtream_active) + (m3u_total - m3u_active) + (plex_servers_total - plex_servers_active)
         },
         "total_content": {
             "movies": movies_count,
@@ -187,7 +187,7 @@ def get_recent_activity(
         source_name = "Unknown"
         source_type = "unknown"
         
-        if sync.sync_type == "movies" or sync.sync_type == "series":
+        if sync.type == "movies" or sync.type == "series":
             # XtreamTV sync
             sub = db.query(Subscription).filter(
                 Subscription.id == sync.subscription_id
@@ -206,7 +206,7 @@ def get_recent_activity(
             "id": sync.id,
             "source_name": source_name,
             "source_type": source_type,
-            "sync_type": sync.sync_type,
+            "sync_type": sync.type,
             "status": sync.status,
             "items_processed": (sync.items_added or 0) + (sync.items_deleted or 0),
             "timestamp": sync.last_sync.isoformat() if sync.last_sync else None,
@@ -221,8 +221,9 @@ def get_recent_activity(
 def get_scheduled_syncs(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
     """Get upcoming scheduled syncs"""
     
+    # The column is `enabled`, not `is_active`
     schedules = db.query(Schedule).filter(
-        Schedule.is_active == True
+        Schedule.enabled == True
     ).all()
     
     scheduled = []
@@ -253,7 +254,7 @@ def get_scheduled_syncs(db: Session = Depends(get_db)) -> List[Dict[str, Any]]:
             "id": schedule.id,
             "source_name": source_name,
             "source_type": source_type,
-            "sync_type": schedule.sync_type,
+            "sync_type": schedule.type.value if hasattr(schedule.type, "value") else str(schedule.type),
             "frequency": schedule.frequency,
             "next_run": next_run.isoformat() if next_run else None,
             "last_run": schedule.last_run.isoformat() if schedule.last_run else None

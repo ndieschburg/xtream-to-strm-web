@@ -180,6 +180,26 @@ def _ensure_schema_up_to_date():
                     except Exception as e:
                         print(f"  ⚠️ Could not recreate plex_schedule_executions: {e}")
 
+        # 6. Check 'plex_series_cache' change-detection columns
+        if "plex_series_cache" in existing_tables:
+            series_cache_cols = [c['name'] for c in inspector.get_columns("plex_series_cache")]
+            series_cache_migrations = [
+                ("updated_at", "VARCHAR"),
+                ("leaf_count", "INTEGER")
+            ]
+            missing_cache_cols = [m for m in series_cache_migrations if m[0] not in series_cache_cols]
+
+            if missing_cache_cols:
+                print(f"🔧 Missing {len(missing_cache_cols)} columns in 'plex_series_cache'. Repairing...")
+                with engine.connect() as conn:
+                    for col_name, col_type in missing_cache_cols:
+                        try:
+                            conn.execute(text(f"ALTER TABLE plex_series_cache ADD COLUMN {col_name} {col_type}"))
+                            conn.commit()
+                            print(f"  ✅ Added {col_name}")
+                        except Exception as e:
+                            print(f"  ⚠️ Could not add {col_name}: {e}")
+
         print("✅ Database schema is up to date.")
             
     except Exception as e:

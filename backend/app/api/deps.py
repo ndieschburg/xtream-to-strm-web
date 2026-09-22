@@ -1,4 +1,4 @@
-from typing import Generator, Optional
+from typing import AsyncGenerator, Callable, Generator, List, Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
@@ -32,3 +32,33 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
             detail="Could not validate credentials",
         )
     return token_data
+
+
+async def xtream_clients() -> AsyncGenerator[Callable[..., "XtreamClient"], None]:
+    """Hand out XtreamClients and close them once the response has been sent.
+
+    Each XtreamClient owns an httpx connection pool. Endpoints that built one
+    inline never closed it, so every request leaked a pool (and its sockets) for
+    the lifetime of the process.
+    """
+    from app.services.xtream import XtreamClient
+
+    created: List["XtreamClient"] = []
+
+    def factory(*args, **kwargs) -> "XtreamClient":
+        client = XtreamClient(*args, **kwargs)
+        created.append(client)
+        return client
+
+    try:
+        yield factory
+    finally:
+        for client in created:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass

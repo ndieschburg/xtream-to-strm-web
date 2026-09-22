@@ -65,6 +65,7 @@ async def queue_download(
     title: str = None,
     trigger_queue: bool = True,
     db: Session = Depends(deps.get_db),
+    new_xtream_client=Depends(deps.xtream_clients),
 ):
     """Queue a media item for download"""
     # Get subscription
@@ -83,7 +84,7 @@ async def queue_download(
     fm = FileManager("") # Output dir doesn't matter for clean_title
     
     # Fetch media info from Xtream
-    xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+    xc = new_xtream_client(subscription.xtream_url, subscription.username, subscription.password)
     
     if title:
         # If title is provided directly (e.g. from frontend), use it
@@ -166,6 +167,7 @@ async def queue_download(
 async def queue_bulk_download(
     data: schemas.DownloadBulkQueueCreate,
     db: Session = Depends(deps.get_db),
+    new_xtream_client=Depends(deps.xtream_clients),
 ):
     """Queue multiple media items for download"""
     created_tasks = []
@@ -177,7 +179,7 @@ async def queue_bulk_download(
         
     xc = None
     if data.media_type == "series":
-        xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+        xc = new_xtream_client(subscription.xtream_url, subscription.username, subscription.password)
     
     for i, media_id in enumerate(data.media_ids):
         title = data.titles[i] if data.titles and i < len(data.titles) else None
@@ -185,7 +187,7 @@ async def queue_bulk_download(
             if data.media_type == "series":
                 # Expand series into episodes (Expansion uses its own title generation)
                 if not xc:
-                    xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+                    xc = new_xtream_client(subscription.xtream_url, subscription.username, subscription.password)
                 
                 try:
                     series_info = await xc.get_series_info(str(media_id))
@@ -246,6 +248,44 @@ async def queue_bulk_download(
     
     return {"queued": len(created_tasks), "tasks": created_tasks}
 
+# NOTE: these batch routes must stay ABOVE the /tasks/{task_id}/... routes.
+# FastAPI matches in declaration order, so a later /tasks/batch/pause is
+# swallowed by /tasks/{task_id}/pause with task_id="batch" (HTTP 422).
+@router.post("/tasks/batch/delete")
+def batch_delete_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
+    db.query(DownloadTask).filter(DownloadTask.id.in_(task_ids)).delete(synchronize_session=False)
+    db.commit()
+    return {"message": f"Deleted {len(task_ids)} tasks"}
+
+@router.post("/tasks/batch/retry")
+def batch_retry_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
+    db.query(DownloadTask).filter(DownloadTask.id.in_(task_ids)).update(
+        {"status": DownloadStatus.PENDING, "error_message": None, "retry_count": 0, "next_retry_at": None},
+        synchronize_session=False
+    )
+    db.commit()
+    process_download_queue.delay()
+    return {"message": f"Retrying {len(task_ids)} tasks"}
+
+@router.post("/tasks/batch/pause")
+def batch_pause_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
+    db.query(DownloadTask).filter(
+        DownloadTask.id.in_(task_ids),
+        DownloadTask.status == DownloadStatus.DOWNLOADING
+    ).update({"status": DownloadStatus.PAUSED, "paused_at": datetime.utcnow()}, synchronize_session=False)
+    db.commit()
+    return {"message": f"Paused tasks"}
+
+@router.post("/tasks/batch/resume")
+def batch_resume_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
+    db.query(DownloadTask).filter(
+        DownloadTask.id.in_(task_ids),
+        DownloadTask.status == DownloadStatus.PAUSED
+    ).update({"status": DownloadStatus.PENDING}, synchronize_session=False)
+    db.commit()
+    process_download_queue.delay()
+    return {"message": f"Resumed tasks"}
+
 @router.delete("/tasks/{task_id}")
 def cancel_download(
     task_id: int,
@@ -299,7 +339,7 @@ def pause_download(
     
     if task.status == DownloadStatus.DOWNLOADING:
         task.status = DownloadStatus.PAUSED
-        task.paused_at = datetime.now()
+        task.paused_at = datetime.utcnow()
         db.commit()
         return {"message": "Task paused"}
     
@@ -367,41 +407,6 @@ def move_down_priority(
     return {"message": "Priority decreased", "priority": task.priority}
 
 # Batch Operations
-@router.post("/tasks/batch/delete")
-def batch_delete_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
-    db.query(DownloadTask).filter(DownloadTask.id.in_(task_ids)).delete(synchronize_session=False)
-    db.commit()
-    return {"message": f"Deleted {len(task_ids)} tasks"}
-
-@router.post("/tasks/batch/retry")
-def batch_retry_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
-    db.query(DownloadTask).filter(DownloadTask.id.in_(task_ids)).update(
-        {"status": DownloadStatus.PENDING, "error_message": None, "retry_count": 0, "next_retry_at": None},
-        synchronize_session=False
-    )
-    db.commit()
-    process_download_queue.delay()
-    return {"message": f"Retrying {len(task_ids)} tasks"}
-
-@router.post("/tasks/batch/pause")
-def batch_pause_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
-    db.query(DownloadTask).filter(
-        DownloadTask.id.in_(task_ids),
-        DownloadTask.status == DownloadStatus.DOWNLOADING
-    ).update({"status": DownloadStatus.PAUSED, "paused_at": datetime.now()}, synchronize_session=False)
-    db.commit()
-    return {"message": f"Paused tasks"}
-
-@router.post("/tasks/batch/resume")
-def batch_resume_tasks(task_ids: List[int], db: Session = Depends(deps.get_db)):
-    db.query(DownloadTask).filter(
-        DownloadTask.id.in_(task_ids),
-        DownloadTask.status == DownloadStatus.PAUSED
-    ).update({"status": DownloadStatus.PENDING}, synchronize_session=False)
-    db.commit()
-    process_download_queue.delay()
-    return {"message": f"Resumed tasks"}
-
 @router.get("/monitored")
 def get_monitored_media(db: Session = Depends(deps.get_db)):
     """Get all monitored media items"""
@@ -498,13 +503,14 @@ async def browse_media(
     subscription_id: int,
     media_type: str,
     db: Session = Depends(deps.get_db),
+    new_xtream_client=Depends(deps.xtream_clients),
 ):
     """Browse available media from a subscription for downloading"""
     subscription = db.query(Subscription).filter(Subscription.id == subscription_id).first()
     if not subscription:
         raise HTTPException(status_code=404, detail="Subscription not found")
     
-    xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+    xc = new_xtream_client(subscription.xtream_url, subscription.username, subscription.password)
     
     if media_type == "movies":
         categories = await xc.get_vod_categories()
@@ -554,13 +560,14 @@ async def get_series_details(
     subscription_id: int,
     series_id: str,
     db: Session = Depends(deps.get_db),
+    new_xtream_client=Depends(deps.xtream_clients),
 ):
     """Get detailed info for a specific series including seasons and episodes"""
     subscription = db.query(Subscription).filter(Subscription.id == subscription_id).first()
     if not subscription:
         raise HTTPException(status_code=404, detail="Subscription not found")
     
-    xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+    xc = new_xtream_client(subscription.xtream_url, subscription.username, subscription.password)
     
     try:
         data = await xc.get_series_info(series_id)

@@ -40,6 +40,7 @@ def get_global_settings(db: Session):
     return settings
 
 def update_daily_stats(db: Session, success=True, bytes_downloaded=0.0):
+    # Local calendar day on purpose: this is the date label shown to the user
     today = datetime.now().strftime("%Y-%m-%d")
     stats = db.query(DownloadStatistics).filter(DownloadStatistics.date == today).first()
     if not stats:
@@ -59,11 +60,13 @@ def is_quiet_hours(settings: DownloadSettingsGlobal):
     if not settings.quiet_hours_start or not settings.quiet_hours_end:
         return False
     
+    # Local wall-clock on purpose: quiet_hours_start/end are times the user
+    # typed ("23:00"), not UTC instants.
     now = datetime.now().time()
     try:
         start = datetime.strptime(settings.quiet_hours_start, "%H:%M").time()
         end = datetime.strptime(settings.quiet_hours_end, "%H:%M").time()
-    except:
+    except Exception:
         return False
     
     if start <= end:
@@ -77,14 +80,14 @@ def cleanup_old_tasks(db: Session, settings: DownloadSettingsGlobal):
         return
     
     # Completed tasks
-    completed_limit = datetime.now() - timedelta(days=settings.keep_completed_days or 7)
+    completed_limit = datetime.utcnow() - timedelta(days=settings.keep_completed_days or 7)
     db.query(DownloadTask).filter(
         DownloadTask.status == DownloadStatus.COMPLETED,
         DownloadTask.completed_at < completed_limit
     ).delete()
     
     # Failed tasks
-    failed_limit = datetime.now() - timedelta(days=settings.keep_failed_days or 7)
+    failed_limit = datetime.utcnow() - timedelta(days=settings.keep_failed_days or 7)
     db.query(DownloadTask).filter(
         DownloadTask.status == DownloadStatus.FAILED,
         DownloadTask.created_at < failed_limit
@@ -109,185 +112,188 @@ def _resolve_target_path(db: Session, download: DownloadTask, subscription: Subs
     fm = FileManager(base_dir)
     cat_name = "Uncategorized"
     xc = XtreamClient(subscription.xtream_url, subscription.username, subscription.password)
+    try:
 
-    if download.media_type == "movie":
-        movie_cache = db.query(MovieCache).filter(
-            MovieCache.subscription_id == download.subscription_id,
-            MovieCache.stream_id == int(download.media_id)
-        ).first()
-        
-        category_id = movie_cache.category_id if movie_cache else None
-        movie_name = movie_cache.name if movie_cache else download.title
-        tmdb_id = movie_cache.tmdb_id if movie_cache else None
-
-        # Fallback to API if cache is missing or incomplete
-        if not movie_cache:
-            try:
-                logger.info(f"Movie cache missing for ID {download.media_id}. Fetching from API.")
-                movies = xc.get_vod_streams_sync()
-                media = next((m for m in movies if str(m['stream_id']) == str(download.media_id)), None)
-                if media:
-                    movie_name = media.get('name', movie_name)
-                    category_id = media.get('category_id')
-                    tmdb_id = media.get('tmdb')
-            except Exception as e:
-                logger.warning(f"Failed to fetch movie info from API: {e}")
-        
-        movie_name = movie_name.strip().strip('-').strip()
-
-        if category_id:
-            try:
-                categories = xc.get_vod_categories_sync()
-                cat_map = {str(c['category_id']): c['category_name'] for c in categories}
-                cat_name = cat_map.get(str(category_id), "Uncategorized")
-            except Exception as e: 
-                logger.warning(f"Failed to fetch VOD categories: {e}")
-        
-        movie_data = {
-            "name": movie_name,
-            "tmdb": tmdb_id
-        }
-        target_info = fm.get_movie_target_info(movie_data, cat_name, prefix_regex, format_date, clean_name)
-        
-        save_dir = Path(target_info["target_dir"])
-        save_dir.mkdir(parents=True, exist_ok=True)
-        return save_dir / f"{target_info['filename_base']}.mp4"
-
-    else: # episode
-        episode_cache = db.query(EpisodeCache).filter(
-            EpisodeCache.subscription_id == download.subscription_id,
-            EpisodeCache.id == int(download.media_id)
-        ).first()
-        
-        series_cache = None
-        series_id = None
-        season_num = 1
-        ep_num = 1
-        ep_title = ""
-
-        if episode_cache:
-            series_id = episode_cache.series_id
-            season_num = episode_cache.season_num
-            ep_num = episode_cache.episode_num
-            ep_title = episode_cache.title
-            
-            series_cache = db.query(SeriesCache).filter(
-                SeriesCache.subscription_id == download.subscription_id,
-                SeriesCache.series_id == series_id
+        if download.media_type == "movie":
+            movie_cache = db.query(MovieCache).filter(
+                MovieCache.subscription_id == download.subscription_id,
+                MovieCache.stream_id == int(download.media_id)
             ).first()
-        else:
-            # If no episode cache, try to parse from title
-            logger.info(f"DEBUG_PATH: Episode cache missing for ID {download.media_id}. Title: '{download.title}'")
-            import re
+        
+            category_id = movie_cache.category_id if movie_cache else None
+            movie_name = movie_cache.name if movie_cache else download.title
+            tmdb_id = movie_cache.tmdb_id if movie_cache else None
+
+            # Fallback to API if cache is missing or incomplete
+            if not movie_cache:
+                try:
+                    logger.info(f"Movie cache missing for ID {download.media_id}. Fetching from API.")
+                    movies = xc.get_vod_streams_sync()
+                    media = next((m for m in movies if str(m['stream_id']) == str(download.media_id)), None)
+                    if media:
+                        movie_name = media.get('name', movie_name)
+                        category_id = media.get('category_id')
+                        tmdb_id = media.get('tmdb')
+                except Exception as e:
+                    logger.warning(f"Failed to fetch movie info from API: {e}")
+        
+            movie_name = movie_name.strip().strip('-').strip()
+
+            if category_id:
+                try:
+                    categories = xc.get_vod_categories_sync()
+                    cat_map = {str(c['category_id']): c['category_name'] for c in categories}
+                    cat_name = cat_map.get(str(category_id), "Uncategorized")
+                except Exception as e: 
+                    logger.warning(f"Failed to fetch VOD categories: {e}")
+        
+            movie_data = {
+                "name": movie_name,
+                "tmdb": tmdb_id
+            }
+            target_info = fm.get_movie_target_info(movie_data, cat_name, prefix_regex, format_date, clean_name)
+        
+            save_dir = Path(target_info["target_dir"])
+            save_dir.mkdir(parents=True, exist_ok=True)
+            return save_dir / f"{target_info['filename_base']}.mp4"
+
+        else: # episode
+            episode_cache = db.query(EpisodeCache).filter(
+                EpisodeCache.subscription_id == download.subscription_id,
+                EpisodeCache.id == int(download.media_id)
+            ).first()
+        
+            series_cache = None
+            series_id = None
+            season_num = 1
+            ep_num = 1
+            ep_title = ""
+
+            if episode_cache:
+                series_id = episode_cache.series_id
+                season_num = episode_cache.season_num
+                ep_num = episode_cache.episode_num
+                ep_title = episode_cache.title
             
-            # Robust regex for series titles
-            m = re.search(r'^(.*?)(?:\s+-\s*|\s+)S(\d+)E(\d+)(?:\s*[- ]+\s*(.*))?$', download.title, re.IGNORECASE)
-            if not m:
-                logger.info("DEBUG_PATH: Main regex failed. Trying fallback.")
-                m = re.search(r'S(\d+)E(\d+)\s+(.*)$', download.title, re.IGNORECASE)
-                if m:
-                    season_num = int(m.group(1))
-                    ep_num = int(m.group(2))
-                    series_name = m.group(3).strip().strip('-').strip()
-                    logger.info(f"DEBUG_PATH: Fallback match: s={season_num} e={ep_num} name='{series_name}'")
-            else:
-                series_name = m.group(1).strip().strip('-').strip()
-                season_num = int(m.group(2))
-                ep_num = int(m.group(3))
-                ep_title = m.group(4).strip() if m.group(4) else ""
-                logger.info(f"DEBUG_PATH: Main match: name='{series_name}' s={season_num} e={ep_num} title='{ep_title}'")
-                
-            if 'series_name' in locals() and series_name and series_name != "Unknown Series":
-                # Try to find a series by this name in cache to get category
                 series_cache = db.query(SeriesCache).filter(
                     SeriesCache.subscription_id == download.subscription_id,
-                    SeriesCache.name.ilike(series_name)
+                    SeriesCache.series_id == series_id
                 ).first()
-                
-                if series_cache:
-                    series_name = series_cache.name
-                    category_id = series_cache.category_id
-                    tmdb_id = series_cache.tmdb_id
-                    logger.info(f"DEBUG_PATH: Name lookup SUCCESS: series='{series_name}' cat_id={category_id}")
+            else:
+                # If no episode cache, try to parse from title
+                logger.info(f"DEBUG_PATH: Episode cache missing for ID {download.media_id}. Title: '{download.title}'")
+                import re
+            
+                # Robust regex for series titles
+                m = re.search(r'^(.*?)(?:\s+-\s*|\s+)S(\d+)E(\d+)(?:\s*[- ]+\s*(.*))?$', download.title, re.IGNORECASE)
+                if not m:
+                    logger.info("DEBUG_PATH: Main regex failed. Trying fallback.")
+                    m = re.search(r'S(\d+)E(\d+)\s+(.*)$', download.title, re.IGNORECASE)
+                    if m:
+                        season_num = int(m.group(1))
+                        ep_num = int(m.group(2))
+                        series_name = m.group(3).strip().strip('-').strip()
+                        logger.info(f"DEBUG_PATH: Fallback match: s={season_num} e={ep_num} name='{series_name}'")
                 else:
-                    logger.info(f"DEBUG_PATH: Name lookup FAILED in cache for '{series_name}'. Trying API.")
+                    series_name = m.group(1).strip().strip('-').strip()
+                    season_num = int(m.group(2))
+                    ep_num = int(m.group(3))
+                    ep_title = m.group(4).strip() if m.group(4) else ""
+                    logger.info(f"DEBUG_PATH: Main match: name='{series_name}' s={season_num} e={ep_num} title='{ep_title}'")
+                
+                if 'series_name' in locals() and series_name and series_name != "Unknown Series":
+                    # Try to find a series by this name in cache to get category
+                    series_cache = db.query(SeriesCache).filter(
+                        SeriesCache.subscription_id == download.subscription_id,
+                        SeriesCache.name.ilike(series_name)
+                    ).first()
+                
+                    if series_cache:
+                        series_name = series_cache.name
+                        category_id = series_cache.category_id
+                        tmdb_id = series_cache.tmdb_id
+                        logger.info(f"DEBUG_PATH: Name lookup SUCCESS: series='{series_name}' cat_id={category_id}")
+                    else:
+                        logger.info(f"DEBUG_PATH: Name lookup FAILED in cache for '{series_name}'. Trying API.")
+                        try:
+                            api_series = xc.get_series_sync()
+                            # Case-insensitive match in API results
+                            s_data = next((s for s in api_series if s.get('name', '').lower() == series_name.lower()), None)
+                            if s_data:
+                                series_name = s_data.get('name', series_name)
+                                category_id = s_data.get('category_id')
+                                tmdb_id = s_data.get('tmdb')
+                                logger.info(f"DEBUG_PATH: API Name match SUCCESS: series='{series_name}' cat_id={category_id}")
+                            else:
+                                logger.info(f"DEBUG_PATH: API Name match FAILED for '{series_name}'")
+                        except Exception as e:
+                            logger.warning(f"DEBUG_PATH: API series fetch failed: {e}")
+
+            # Basic defaults if not resolved
+            if 'series_name' not in locals(): series_name = "Unknown Series"
+            if 'category_id' not in locals(): category_id = None
+            if 'tmdb_id' not in locals(): tmdb_id = None
+        
+            logger.info(f"DEBUG_PATH: Final resolved: name='{series_name}' cat_id={category_id} tmdb={tmdb_id}")
+
+            if series_cache:
+                series_name = series_cache.name
+                category_id = series_cache.category_id
+                tmdb_id = series_cache.tmdb_id
+            elif not category_id:
+                # Try to fetch series info from API if we have series_id
+                if series_id:
                     try:
-                        api_series = xc.get_series_sync()
-                        # Case-insensitive match in API results
-                        s_data = next((s for s in api_series if s.get('name', '').lower() == series_name.lower()), None)
+                        logger.info(f"Series cache missing for ID {series_id}. Fetching from API.")
+                        series_list = xc.get_series_sync()
+                        s_data = next((s for s in series_list if str(s['series_id']) == str(series_id)), None)
                         if s_data:
                             series_name = s_data.get('name', series_name)
                             category_id = s_data.get('category_id')
                             tmdb_id = s_data.get('tmdb')
-                            logger.info(f"DEBUG_PATH: API Name match SUCCESS: series='{series_name}' cat_id={category_id}")
-                        else:
-                            logger.info(f"DEBUG_PATH: API Name match FAILED for '{series_name}'")
                     except Exception as e:
-                        logger.warning(f"DEBUG_PATH: API series fetch failed: {e}")
+                        logger.warning(f"Failed to fetch series info from API: {e}")
 
-        # Basic defaults if not resolved
-        if 'series_name' not in locals(): series_name = "Unknown Series"
-        if 'category_id' not in locals(): category_id = None
-        if 'tmdb_id' not in locals(): tmdb_id = None
-        
-        logger.info(f"DEBUG_PATH: Final resolved: name='{series_name}' cat_id={category_id} tmdb={tmdb_id}")
-
-        if series_cache:
-            series_name = series_cache.name
-            category_id = series_cache.category_id
-            tmdb_id = series_cache.tmdb_id
-        elif not category_id:
-            # Try to fetch series info from API if we have series_id
-            if series_id:
+            if category_id:
                 try:
-                    logger.info(f"Series cache missing for ID {series_id}. Fetching from API.")
-                    series_list = xc.get_series_sync()
-                    s_data = next((s for s in series_list if str(s['series_id']) == str(series_id)), None)
-                    if s_data:
-                        series_name = s_data.get('name', series_name)
-                        category_id = s_data.get('category_id')
-                        tmdb_id = s_data.get('tmdb')
+                    categories = xc.get_series_categories_sync()
+                    cat_map = {str(c['category_id']): c['category_name'] for c in categories}
+                    cat_name = cat_map.get(str(category_id), "Uncategorized")
                 except Exception as e:
-                    logger.warning(f"Failed to fetch series info from API: {e}")
-
-        if category_id:
-            try:
-                categories = xc.get_series_categories_sync()
-                cat_map = {str(c['category_id']): c['category_name'] for c in categories}
-                cat_name = cat_map.get(str(category_id), "Uncategorized")
-            except Exception as e:
-                logger.warning(f"Failed to fetch series categories: {e}")
+                    logger.warning(f"Failed to fetch series categories: {e}")
         
-        series_data = {
-            "name": series_name,
-            "tmdb": tmdb_id
-        }
-        target_info = fm.get_series_target_info(series_data, cat_name, prefix_regex, format_date, clean_name, use_category_folders)
+            series_data = {
+                "name": series_name,
+                "tmdb": tmdb_id
+            }
+            target_info = fm.get_series_target_info(series_data, cat_name, prefix_regex, format_date, clean_name, use_category_folders)
         
-        series_dir = Path(target_info["series_dir"])
-        series_dir.mkdir(parents=True, exist_ok=True)
+            series_dir = Path(target_info["series_dir"])
+            series_dir.mkdir(parents=True, exist_ok=True)
         
-        # Determine filename
-        current_dir = series_dir / f"Season {season_num:02d}" if use_season_folders else series_dir
-        current_dir.mkdir(parents=True, exist_ok=True)
+            # Determine filename
+            current_dir = series_dir / f"Season {season_num:02d}" if use_season_folders else series_dir
+            current_dir.mkdir(parents=True, exist_ok=True)
         
-        formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
-        safe_series_name = target_info["safe_series_name"]
+            formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
+            safe_series_name = target_info["safe_series_name"]
         
-        if ep_title:
-            if ep_title.lower().endswith(".mp4"):
-                ep_title = ep_title[:-4]
-            safe_ep_title = fm.sanitize_name(ep_title)
-        else:
-            safe_ep_title = ""
+            if ep_title:
+                if ep_title.lower().endswith(".mp4"):
+                    ep_title = ep_title[:-4]
+                safe_ep_title = fm.sanitize_name(ep_title)
+            else:
+                safe_ep_title = ""
         
-        if include_series_name:
-            filename_base = f"{safe_series_name} - {formatted_ep}"
-        else:
-            filename_base = formatted_ep
+            if include_series_name:
+                filename_base = f"{safe_series_name} - {formatted_ep}"
+            else:
+                filename_base = formatted_ep
         
-        filename = f"{filename_base} - {safe_ep_title}.mp4" if safe_ep_title else f"{filename_base}.mp4"
-        return current_dir / filename
+            filename = f"{filename_base} - {safe_ep_title}.mp4" if safe_ep_title else f"{filename_base}.mp4"
+            return current_dir / filename
+    finally:
+        xc.close()
 
 def _perform_download_stream(db: Session, download: DownloadTask, save_path: Path, settings: DownloadSettingsGlobal):
     """Core download logic with retry support, throttling, and optimized DB refresh."""
@@ -384,7 +390,7 @@ def _perform_download_stream(db: Session, download: DownloadTask, save_path: Pat
                             download.file_size = srv_size
                             download.downloaded_bytes = existing_size
                             return True
-                    except: pass
+                    except Exception: pass
                     # Else reset
                     existing_size = 0
                     download.downloaded_bytes = 0
@@ -429,7 +435,7 @@ def _process_auto_downloads_sync(db: Session):
                         ))
                         new_tasks += 1
                         existing_ids.add(sid)
-            except: pass
+            except Exception: pass
         
         elif item.media_type == "series":
             try:
@@ -458,7 +464,7 @@ def _process_auto_downloads_sync(db: Session):
                             ))
                             new_tasks += 1
                             existing_ids.add(sid)
-            except: pass
+            except Exception: pass
 
         elif item.media_type == "category_series":
             try:
@@ -492,11 +498,13 @@ def _process_auto_downloads_sync(db: Session):
                                     ))
                                     new_tasks += 1
                                     existing_ids.add(ep_sid)
-                    except:
+                    except Exception:
                         continue
-            except: pass
+            except Exception: pass
         
-        item.last_check = datetime.now()
+        xc.close()
+
+        item.last_check = datetime.utcnow()
         db.commit()
         if new_tasks > 0:
             logger.info(f"Auto-download: Queued {new_tasks} items for {item.title}")
@@ -527,7 +535,7 @@ def download_media_task(self, download_id: int):
         
         # 2. Start Download
         download.status = DownloadStatus.DOWNLOADING
-        download.started_at = datetime.now()
+        download.started_at = datetime.utcnow()
         download.task_id = self.request.id
         db.commit()
 
@@ -535,7 +543,7 @@ def download_media_task(self, download_id: int):
 
         if success:
             download.status = DownloadStatus.COMPLETED
-            download.completed_at = datetime.now()
+            download.completed_at = datetime.utcnow()
             download.progress = 100.0
             download.save_path = str(save_path)
             db.commit()
@@ -552,7 +560,7 @@ def download_media_task(self, download_id: int):
             if download.retry_count < max_r:
                 delay = 60 * (2 ** (download.retry_count - 1))
                 download.status = DownloadStatus.PENDING
-                download.next_retry_at = datetime.now() + timedelta(seconds=delay)
+                download.next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
                 download.error_message = f"Retry {download.retry_count}/{max_r}: {e}"
                 db.commit()
                 download_media_task.apply_async(args=[download_id], countdown=delay)
@@ -589,10 +597,10 @@ def process_download_queue():
             if all_pending:
                 all_pending.sort(key=lambda x: (x.priority or 0, x.created_at), reverse=True)
                 download = all_pending[0]
-                if not download.scheduled_start_at or download.scheduled_start_at <= datetime.now():
+                if not download.scheduled_start_at or download.scheduled_start_at <= datetime.utcnow():
                     # Mark as downloading immediately to reserve the slot
                     download.status = DownloadStatus.DOWNLOADING
-                    download.started_at = datetime.now()
+                    download.started_at = datetime.utcnow()
                     db.commit()
                     
                     download_media_task.delay(download.id)
@@ -614,12 +622,12 @@ def process_download_queue():
                 ).order_by(DownloadTask.priority.desc(), DownloadTask.created_at.asc()).limit(available_slots).all()
                 
                 for download in pending_downloads:
-                    if download.scheduled_start_at and download.scheduled_start_at > datetime.now():
+                    if download.scheduled_start_at and download.scheduled_start_at > datetime.utcnow():
                         continue
                     
                     # Mark as downloading immediately to reserve the slot
                     download.status = DownloadStatus.DOWNLOADING
-                    download.started_at = datetime.now()
+                    download.started_at = datetime.utcnow()
                     db.commit() # Commit each one to be safe for other concurrent processors
                     
                     download_media_task.delay(download.id)

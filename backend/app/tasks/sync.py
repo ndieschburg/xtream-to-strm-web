@@ -125,7 +125,7 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
         db.add(sync_state)
     
     sync_state.status = SyncStatus.RUNNING
-    sync_state.last_sync = datetime.now()
+    sync_state.last_sync = datetime.utcnow()
     db.commit()
 
     try:

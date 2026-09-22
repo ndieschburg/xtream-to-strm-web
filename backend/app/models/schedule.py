@@ -31,7 +31,7 @@ class Schedule(Base):
     
     def calculate_next_run(self) -> datetime:
         """Calculate next run time based on frequency"""
-        now = datetime.now()
+        now = datetime.utcnow()
         base_time = self.last_run if self.last_run else now
         
         if self.frequency == Frequency.FIVE_MINUTES:

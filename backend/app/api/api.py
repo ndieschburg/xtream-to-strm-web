@@ -14,6 +14,7 @@ api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboar
 api_router.include_router(m3u_sources.router, prefix="/m3u-sources", tags=["m3u"])
 api_router.include_router(m3u_selection.router, prefix="/m3u-selection", tags=["m3u"])
 api_router.include_router(m3u_sync.router, prefix="/m3u-sync", tags=["m3u-sync"])
+api_router.include_router(downloads.router, prefix="/downloads", tags=["downloads"])
 from app.api.api_v1.endpoints import live
 api_router.include_router(live.router, prefix="/live", tags=["live"])
 api_router.include_router(jellyfin.router, prefix="/jellyfin", tags=["jellyfin"])

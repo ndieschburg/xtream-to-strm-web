@@ -374,7 +374,10 @@ class PlexClient:
                     "art": item.art if hasattr(item, 'art') else None,
                     "guid": self._parse_guid(item),
                     "updated_at": str(item.updatedAt) if hasattr(item, 'updatedAt') and item.updatedAt else None,
-                    "season_count": item.childCount if hasattr(item, 'childCount') else 0
+                    "season_count": item.childCount if hasattr(item, 'childCount') else 0,
+                    # Total episode count: changes whenever an episode is added or
+                    # removed, which updatedAt alone does not reliably capture
+                    "leaf_count": item.leafCount if hasattr(item, 'leafCount') else None
                 }
                 shows.append(show_data)
             except Exception as e:

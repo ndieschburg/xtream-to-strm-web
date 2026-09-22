@@ -213,14 +213,26 @@ def get_disk_usage():
         return {"message": f"Error getting disk usage: {str(e)}", "success": False}
 
 
+# Only these files may be read through /view-logs. Without the allow-list the
+# endpoint reads any path the process can open, including /db/xtream.db, which
+# holds the Xtream credentials and Plex tokens in clear text.
+ALLOWED_LOG_FILES = {"app.log"}
+
+
 @router.get("/view-logs")
 def view_logs(log_file_path: str = "app.log"):
     """View the content of a specified log file."""
     try:
+        if log_file_path not in ALLOWED_LOG_FILES:
+            return {
+                "message": f"Log file not allowed: {log_file_path}",
+                "success": False
+            }
+
         if not os.path.exists(log_file_path):
             return {"message": f"Log file not found at {log_file_path}", "success": False}
 
-        with open(log_file_path, "r") as f:
+        with open(log_file_path, "r", encoding="utf-8", errors="replace") as f:
             logs = f.read()
 
         return {

@@ -122,7 +122,7 @@ class EPGService:
             clean_date = date_str.split(" ")[0]
             dt = datetime.strptime(clean_date[:14], "%Y%m%d%H%M%S")
             return dt.timestamp()
-        except:
+        except Exception:
             return 0.0
 
     def search_channels(self, source_id: int, query: str) -> List[dict]:
@@ -261,6 +261,8 @@ class EPGService:
         except Exception as e:
             logger.error(f"Failed to fetch streams: {e}")
             stream_map = {}
+        finally:
+            await client.aclose()
 
         # 3. Perform matching
         match_count = 0

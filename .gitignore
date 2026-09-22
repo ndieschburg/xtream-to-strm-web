@@ -45,10 +45,13 @@ frontend/.vite/
 Thumbs.db
 
 # Output & Data
-output/
-output_backup/
-data/
-db/
+# Anchored to the repo root: the bare patterns also matched the Python package
+# backend/app/db/, which kept session.py and base_class.py out of git and made
+# a fresh clone unable to start ("No module named 'app.db.session'").
+/output/
+/output_backup/
+/data/
+/db/
 
 # Screenshots (keep for documentation)
 !screenshots/

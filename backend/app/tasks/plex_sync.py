@@ -218,7 +218,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
         db.add(sync_state)
 
     sync_state.status = "running"
-    sync_state.last_sync = datetime.now()
+    sync_state.last_sync = datetime.utcnow()
     sync_state.error_message = None
     db.commit()
 
@@ -276,7 +276,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
                             import ast
                             cached_guid = ast.literal_eval(cached.guid)
                             cached_tmdb = cached_guid.get("tmdb")
-                        except:
+                        except Exception:
                             pass
 
                     if (cached.title != movie.get("title") or
@@ -364,7 +364,7 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
             db.commit()
 
             # Update library last sync
-            library.last_sync = datetime.now()
+            library.last_sync = datetime.utcnow()
             db.commit()
 
         sync_state.items_added = total_added
@@ -407,7 +407,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
         db.add(sync_state)
 
     sync_state.status = "running"
-    sync_state.last_sync = datetime.now()
+    sync_state.last_sync = datetime.utcnow()
     sync_state.error_message = None
     db.commit()
 
@@ -436,6 +436,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
         total_episodes_added = 0
         total_episodes_skipped = 0
         total_series_deleted = 0
+        total_series_skipped = 0
 
         for library in libraries:
             logger.info(f"Processing Plex TV library: {library.title}")
@@ -500,72 +501,89 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                     show_nfo_content = generate_plex_show_nfo(show, fm)
                     await fm.write_nfo(show_nfo_path, show_nfo_content)
 
-                    # Fetch episodes
-                    episodes_by_season = client.get_show_episodes(plex_server, show["key"])
+                    # Plex reports the show as unchanged: skip the episode
+                    # fetch entirely. The episode cache below only avoids file
+                    # writes, the API call happened on every sync regardless.
+                    cached = cached_series.get(show["key"])
+                    show_updated_at = show.get("updated_at")
+                    show_leaf_count = show.get("leaf_count")
+                    unchanged = (
+                        cached is not None
+                        and show_updated_at is not None
+                        and show_leaf_count is not None
+                        and cached.updated_at == show_updated_at
+                        and cached.leaf_count == show_leaf_count
+                    )
 
-                    for season_num, episodes in episodes_by_season.items():
-                        # Season folder
-                        if use_season_folders:
-                            season_dir = os.path.join(series_dir, f"Season {season_num:02d}")
-                        else:
-                            season_dir = series_dir
+                    if unchanged:
+                        total_series_skipped += 1
+                    else:
+                        # Fetch episodes
+                        episodes_by_season = client.get_show_episodes(plex_server, show["key"])
 
-                        fm.ensure_directory(season_dir)
-
-                        for episode in episodes:
-                            ep_num = episode.get("episode_num", 0)
-                            ep_title = episode.get("title", "")
-                            ep_plex_key = episode.get("key")
-                            ep_rating_key = episode.get("rating_key")
-
-                            # Check episode cache - skip if unchanged
-                            cached_ep = cached_episodes.get(ep_plex_key)
-                            if cached_ep:
-                                # Episode exists in cache - check if changed
-                                if (cached_ep.title == ep_title and
-                                    cached_ep.season_num == season_num and
-                                    cached_ep.episode_num == ep_num):
-                                    # Episode unchanged, skip
-                                    total_episodes_skipped += 1
-                                    continue
-
-                            # New or changed episode - process it
-                            total_episodes_added += 1
-
-                            # Format episode filename
-                            formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
-                            if ep_title:
-                                safe_ep_title = fm.sanitize_name(ep_title)
-                                filename = f"{formatted_ep} - {safe_ep_title}"
+                        for season_num, episodes in episodes_by_season.items():
+                            # Season folder
+                            if use_season_folders:
+                                season_dir = os.path.join(series_dir, f"Season {season_num:02d}")
                             else:
-                                filename = formatted_ep
+                                season_dir = series_dir
 
-                            # Build proxy URL for streaming
-                            key_param = f"?key={shared_key}" if shared_key else ""
-                            stream_url = f"{proxy_base_url}/api/v1/plex/proxy/{server_id}/{ep_rating_key}/stream.m3u8{key_param}"
+                            fm.ensure_directory(season_dir)
 
-                            # Write STRM
-                            strm_path = os.path.join(season_dir, f"{filename}.strm")
-                            await fm.write_strm(strm_path, stream_url)
+                            for episode in episodes:
+                                ep_num = episode.get("episode_num", 0)
+                                ep_title = episode.get("title", "")
+                                ep_plex_key = episode.get("key")
+                                ep_rating_key = episode.get("rating_key")
 
-                            # Write episode NFO
-                            ep_nfo_path = os.path.join(season_dir, f"{filename}.nfo")
-                            ep_nfo_content = generate_plex_episode_nfo(episode, title, fm)
-                            await fm.write_nfo(ep_nfo_path, ep_nfo_content)
+                                # Check episode cache - skip if unchanged
+                                cached_ep = cached_episodes.get(ep_plex_key)
+                                if cached_ep:
+                                    # Episode exists in cache - check if changed
+                                    if (cached_ep.title == ep_title and
+                                        cached_ep.season_num == season_num and
+                                        cached_ep.episode_num == ep_num):
+                                        # Episode unchanged, skip
+                                        total_episodes_skipped += 1
+                                        continue
 
-                            # Update episode cache
-                            if not cached_ep:
-                                cached_ep = PlexEpisodeCache(
-                                    server_id=server_id,
-                                    series_key=show["key"],
-                                    plex_key=ep_plex_key
-                                )
-                                db.add(cached_ep)
-                                cached_episodes[ep_plex_key] = cached_ep
+                                # New or changed episode - process it
+                                total_episodes_added += 1
 
-                            cached_ep.season_num = season_num
-                            cached_ep.episode_num = ep_num
-                            cached_ep.title = ep_title
+                                # Format episode filename
+                                formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
+                                if ep_title:
+                                    safe_ep_title = fm.sanitize_name(ep_title)
+                                    filename = f"{formatted_ep} - {safe_ep_title}"
+                                else:
+                                    filename = formatted_ep
+
+                                # Build proxy URL for streaming
+                                key_param = f"?key={shared_key}" if shared_key else ""
+                                stream_url = f"{proxy_base_url}/api/v1/plex/proxy/{server_id}/{ep_rating_key}/stream.m3u8{key_param}"
+
+                                # Write STRM
+                                strm_path = os.path.join(season_dir, f"{filename}.strm")
+                                await fm.write_strm(strm_path, stream_url)
+
+                                # Write episode NFO
+                                ep_nfo_path = os.path.join(season_dir, f"{filename}.nfo")
+                                ep_nfo_content = generate_plex_episode_nfo(episode, title, fm)
+                                await fm.write_nfo(ep_nfo_path, ep_nfo_content)
+
+                                # Update episode cache
+                                if not cached_ep:
+                                    cached_ep = PlexEpisodeCache(
+                                        server_id=server_id,
+                                        series_key=show["key"],
+                                        plex_key=ep_plex_key
+                                    )
+                                    db.add(cached_ep)
+                                    cached_episodes[ep_plex_key] = cached_ep
+
+                                cached_ep.season_num = season_num
+                                cached_ep.episode_num = ep_num
+                                cached_ep.title = ep_title
 
                     # Update series cache
                     cached = cached_series.get(show["key"])
@@ -581,6 +599,8 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
                     cached.title = title
                     cached.year = str(year) if year else None
                     cached.guid = str(guid)
+                    cached.updated_at = show_updated_at
+                    cached.leaf_count = show_leaf_count
 
                 except Exception as e:
                     logger.error(f"Error processing Plex show {show.get('title')}: {e}")
@@ -589,10 +609,14 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             db.commit()
 
             # Update library last sync
-            library.last_sync = datetime.now()
+            library.last_sync = datetime.utcnow()
             db.commit()
 
-        logger.info(f"Plex series sync: {total_episodes_added} episodes added/updated, {total_episodes_skipped} skipped (unchanged)")
+        logger.info(
+            f"Plex series sync: {total_episodes_added} episodes added/updated, "
+            f"{total_episodes_skipped} skipped (unchanged), "
+            f"{total_series_skipped} shows skipped without an API call"
+        )
 
         sync_state.items_added = total_episodes_added
         sync_state.items_deleted = total_series_deleted

@@ -89,6 +89,8 @@ async def sync_movie_categories(subscription_id: int, db: Session = Depends(get_
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch from Xtream: {str(e)}")
+    finally:
+        await client.aclose()
 
     # Clear existing movie categories for this subscription
     db.query(Category).filter(
@@ -97,7 +99,7 @@ async def sync_movie_categories(subscription_id: int, db: Session = Depends(get_
     ).delete()
     
     # Add new categories
-    now = datetime.now()
+    now = datetime.utcnow()
     for cat in categories:
         cat_id = str(cat["category_id"])
         db.add(Category(
@@ -133,6 +135,8 @@ async def sync_series_categories(subscription_id: int, db: Session = Depends(get
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch from Xtream: {str(e)}")
+    finally:
+        await client.aclose()
 
     # Clear existing series categories for this subscription
     db.query(Category).filter(
@@ -141,7 +145,7 @@ async def sync_series_categories(subscription_id: int, db: Session = Depends(get
     ).delete()
     
     # Add new categories
-    now = datetime.now()
+    now = datetime.utcnow()
     for cat in categories:
         cat_id = str(cat["category_id"])
         db.add(Category(

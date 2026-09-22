@@ -33,6 +33,8 @@ async def get_live_categories(
         raise HTTPException(status_code=502, detail=f"Provider connection failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch categories: {str(e)}")
+    finally:
+        await client.aclose()
 
 @router.get("/streams/{category_id}", response_model=List[Any])
 async def get_live_streams(
@@ -55,6 +57,8 @@ async def get_live_streams(
         raise HTTPException(status_code=502, detail=f"Provider connection failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch streams: {str(e)}")
+    finally:
+        await client.aclose()
 
 # --- Playlist Management ---
 
@@ -475,9 +479,9 @@ async def search_live_streams(
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
     
-    client = XtreamClient(sub.xtream_url, sub.username, sub.password)
-    all_streams = await client.get_live_streams()
-    categories = await client.get_live_categories()
+    async with XtreamClient(sub.xtream_url, sub.username, sub.password) as client:
+        all_streams = await client.get_live_streams()
+        categories = await client.get_live_categories()
     
     cat_map = {str(c.get("category_id")): c.get("category_name") for c in categories}
     
@@ -539,7 +543,10 @@ async def generate_m3u_playlist(
     
     # Performance: Fetch ALL streams from subscription once to handle cross-category mixing
     # In a very large account this might be slow, but for 4-pane builder it's necessary.
-    all_streams_list = await client.get_live_streams()
+    try:
+        all_streams_list = await client.get_live_streams()
+    finally:
+        await client.aclose()
     all_streams = {str(s.get("stream_id")): s for s in all_streams_list}
     
     # Iterate through bouquets in order

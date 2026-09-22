@@ -67,7 +67,7 @@ def should_reparse_m3u(source: M3USource, existing_count: int, force: bool = Fal
     
     # For URL sources, reparse if it's been > 1 hour since last sync
     if source.last_sync:
-        time_since_sync = datetime.now() - source.last_sync
+        time_since_sync = datetime.utcnow() - source.last_sync
         if time_since_sync < timedelta(hours=1):
             logger.info(f"M3U URL recently synced for {source.name}, using cache")
             return False
@@ -434,7 +434,7 @@ def sync_m3u_source_task(source_id: int, sync_types: list = None, force: bool = 
                             state.task_id = None
                             
                 db.commit()
-        except:
+        except Exception:
             pass
         return {"error": str(e)}
     finally:

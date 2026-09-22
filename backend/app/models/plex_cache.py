@@ -41,6 +41,7 @@ class PlexSeriesCache(Base):
     year = Column(String, nullable=True)
     guid = Column(String, nullable=True)
     updated_at = Column(String, nullable=True)
+    leaf_count = Column(Integer, nullable=True)
 
 
 class PlexEpisodeCache(Base):
