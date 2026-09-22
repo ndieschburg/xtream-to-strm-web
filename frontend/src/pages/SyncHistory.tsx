@@ -16,6 +16,9 @@ interface SyncHistoryItem {
     items_added: number;
     items_deleted: number;
     items_total: number;
+    files_written: number;
+    item_unit: string;
+    has_details: boolean;
     error_message: string | null;
 }
 
@@ -258,7 +261,7 @@ export default function SyncHistory() {
                                         <th className="p-3 text-left">Completed</th>
                                         <th className="p-3 text-left">Duration</th>
                                         <th className="p-3 text-left">Status</th>
-                                        <th className="p-3 text-right">Items</th>
+                                        <th className="p-3 text-right">Changes</th>
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y">
@@ -286,8 +289,22 @@ export default function SyncHistory() {
                                                 {getStatusBadge(item.status)}
                                             </td>
                                             <td className="p-3 text-right font-medium">
-                                                {item.items_total > 0 ? (
-                                                    <span title={`Added: ${item.items_added}, Deleted: ${item.items_deleted}`}>
+                                                {item.has_details ? (
+                                                    <div
+                                                        className="flex flex-col items-end"
+                                                        title={`${item.items_added} ${item.item_unit} added or updated, ${item.items_deleted} deleted - ${item.files_written} STRM files written to disk`}
+                                                    >
+                                                        <span>
+                                                            <span className="text-green-600">+{item.items_added}</span>
+                                                            <span className="text-muted-foreground"> / </span>
+                                                            <span className="text-red-600">-{item.items_deleted}</span>
+                                                        </span>
+                                                        <span className="text-xs font-normal text-muted-foreground">
+                                                            {item.item_unit} - {item.files_written} strm
+                                                        </span>
+                                                    </div>
+                                                ) : item.items_total > 0 ? (
+                                                    <span title="Older run: additions and deletions were not stored separately">
                                                         {item.items_total}
                                                     </span>
                                                 ) : '-'}

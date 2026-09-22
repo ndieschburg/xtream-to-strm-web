@@ -23,6 +23,35 @@ class FileManager:
     def ensure_directory(self, path: str):
         os.makedirs(path, exist_ok=True)
 
+    async def _read_existing(self, path: str) -> Optional[str]:
+        """Read a file for comparison purposes, None if unreadable"""
+        try:
+            async with aiofiles.open(path, 'r', encoding='utf-8', errors='replace') as f:
+                return await f.read()
+        except (OSError, ValueError):
+            return None
+
+    async def _write_if_changed(self, path: str, content: str) -> bool:
+        """
+        Write content only when it differs from what is already on disk.
+
+        Media servers (Jellyfin/Kodi) use the modification time to decide what
+        to rescan, so an unchanged file must keep its mtime untouched.
+
+        @param path Path to the file
+        @param content Content to write
+        @returns True if the file was written, False if left untouched
+        """
+        if os.path.exists(path):
+            existing_content = await self._read_existing(path)
+            # Unreadable file: rewrite it rather than leaving it broken
+            if existing_content is not None and existing_content.strip() == content.strip():
+                return False
+
+        async with aiofiles.open(path, 'w', encoding='utf-8') as f:
+            await f.write(content)
+        return True
+
     async def write_strm(self, path: str, url: str) -> bool:
         """
         Write STRM file only if content has changed.
@@ -31,19 +60,7 @@ class FileManager:
         @param url URL content to write
         @returns True if file was written, False if unchanged
         """
-        # Check if file exists and has the same content
-        if os.path.exists(path):
-            try:
-                async with aiofiles.open(path, 'r') as f:
-                    existing_content = await f.read()
-                if existing_content.strip() == url.strip():
-                    return False  # Content unchanged, skip write
-            except Exception:
-                pass  # If we can't read, just overwrite
-
-        async with aiofiles.open(path, 'w') as f:
-            await f.write(url)
-        return True
+        return await self._write_if_changed(path, url)
 
     async def write_nfo(self, path: str, content: str, skip_if_exists: bool = False) -> bool:
         """
@@ -54,22 +71,10 @@ class FileManager:
         @param skip_if_exists If True, never overwrite existing NFO files
         @returns True if file was written, False if unchanged/skipped
         """
-        if os.path.exists(path):
-            if skip_if_exists:
-                return False  # Never overwrite existing NFO files
+        if skip_if_exists and os.path.exists(path):
+            return False
 
-            # Check if content has changed
-            try:
-                async with aiofiles.open(path, 'r') as f:
-                    existing_content = await f.read()
-                if existing_content.strip() == content.strip():
-                    return False  # Content unchanged, skip write
-            except Exception:
-                pass  # If we can't read, just overwrite
-
-        async with aiofiles.open(path, 'w') as f:
-            await f.write(content)
-        return True
+        return await self._write_if_changed(path, content)
 
     async def delete_file(self, path: str):
         if os.path.exists(path):
@@ -171,6 +176,31 @@ class FileManager:
             "safe_series_name": safe_title,
             "tmdb_id": tmdb_id if tmdb_id and str(tmdb_id) not in ['0', 'None', 'null', ''] else None
         }
+
+    def build_episode_filename(self, safe_series_name: str, season_num: int, episode_num: int,
+                               title: Optional[str] = None, container_extension: Optional[str] = None,
+                               include_series_name: bool = False) -> str:
+        """
+        Build the base filename of an episode, without extension.
+
+        Shared by the sync (file creation) and the cleanup (file removal) so
+        both always agree on the name of a given episode.
+        """
+        filename = f"S{season_num:02d}E{episode_num:02d}"
+
+        if include_series_name and safe_series_name:
+            filename = f"{safe_series_name} - {filename}"
+
+        if title:
+            # Some panels put the container extension in the episode title
+            if container_extension and title.lower().endswith(f".{container_extension.lower()}"):
+                title = title[:-len(container_extension) - 1]
+
+            safe_title = self.sanitize_name(title)
+            if safe_title:
+                filename = f"{filename} - {safe_title}"
+
+        return filename
 
     def generate_movie_nfo(self, movie_data: dict, prefix_regex: Optional[str] = None, format_date: bool = False, clean_name: bool = False) -> str:
         """Generate NFO file for a movie with comprehensive metadata"""

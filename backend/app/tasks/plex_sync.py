@@ -235,10 +235,12 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
             sync_state.items_added = 0
             sync_state.items_deleted = 0
             db.commit()
-            return
+            return {"items_added": 0, "items_deleted": 0, "files_written": 0}
 
+        # Counters are movie-based here, one STRM file per movie
         total_added = 0
         total_deleted = 0
+        strm_written = 0
 
         for library in libraries:
             logger.info(f"Processing Plex movie library: {library.title}")
@@ -333,7 +335,8 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
 
                     # Write STRM
                     strm_path = os.path.join(target_dir, f"{folder_name}.strm")
-                    await fm.write_strm(strm_path, stream_url)
+                    if await fm.write_strm(strm_path, stream_url):
+                        strm_written += 1
 
                     # Generate and write NFO
                     nfo_content = generate_plex_movie_nfo(movie, fm)
@@ -367,10 +370,21 @@ async def process_plex_movies(db: Session, client: PlexClient, plex_server, fm: 
             library.last_sync = datetime.utcnow()
             db.commit()
 
+        logger.info(
+            f"Plex movies sync: {total_added} movies added/updated, "
+            f"{total_deleted} deleted, {strm_written} STRM files written"
+        )
+
         sync_state.items_added = total_added
         sync_state.items_deleted = total_deleted
         sync_state.status = "success"
         db.commit()
+
+        return {
+            "items_added": total_added,
+            "items_deleted": total_deleted,
+            "files_written": strm_written,
+        }
 
     except Exception as e:
         logger.exception("Error syncing Plex movies")
@@ -424,7 +438,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             sync_state.items_added = 0
             sync_state.items_deleted = 0
             db.commit()
-            return
+            return {"items_added": 0, "items_deleted": 0, "files_written": 0}
 
         # Load episode cache for this server
         # Key: plex_key -> PlexEpisodeCache
@@ -433,10 +447,13 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
         ).all()
         cached_episodes = {e.plex_key: e for e in all_cached_episodes}
 
+        # Counters are episode-based here, one STRM file per episode
         total_episodes_added = 0
         total_episodes_skipped = 0
+        total_episodes_deleted = 0
         total_series_deleted = 0
         total_series_skipped = 0
+        strm_written = 0
 
         for library in libraries:
             logger.info(f"Processing Plex TV library: {library.title}")
@@ -463,7 +480,7 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
             for cached_show in to_delete:
                 db.delete(cached_show)
                 # Also delete episodes
-                db.query(PlexEpisodeCache).filter(
+                total_episodes_deleted += db.query(PlexEpisodeCache).filter(
                     PlexEpisodeCache.server_id == server_id,
                     PlexEpisodeCache.series_key == cached_show.plex_key
                 ).delete()
@@ -564,7 +581,8 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
 
                                 # Write STRM
                                 strm_path = os.path.join(season_dir, f"{filename}.strm")
-                                await fm.write_strm(strm_path, stream_url)
+                                if await fm.write_strm(strm_path, stream_url):
+                                    strm_written += 1
 
                                 # Write episode NFO
                                 ep_nfo_path = os.path.join(season_dir, f"{filename}.nfo")
@@ -615,13 +633,21 @@ async def process_plex_series(db: Session, client: PlexClient, plex_server, fm: 
         logger.info(
             f"Plex series sync: {total_episodes_added} episodes added/updated, "
             f"{total_episodes_skipped} skipped (unchanged), "
-            f"{total_series_skipped} shows skipped without an API call"
+            f"{total_series_skipped} shows skipped without an API call, "
+            f"{total_episodes_deleted} deleted with {total_series_deleted} shows, "
+            f"{strm_written} STRM files written"
         )
 
         sync_state.items_added = total_episodes_added
-        sync_state.items_deleted = total_series_deleted
+        sync_state.items_deleted = total_episodes_deleted
         sync_state.status = "success"
         db.commit()
+
+        return {
+            "items_added": total_episodes_added,
+            "items_deleted": total_episodes_deleted,
+            "files_written": strm_written,
+        }
 
     except Exception as e:
         logger.exception("Error syncing Plex series")
@@ -705,7 +731,7 @@ def sync_plex_movies_task(server_id: int, execution_id: int = None):
 
         fm = FileManager(server.movies_dir)
 
-        asyncio.run(process_plex_movies(db, client, plex_server, fm, server_id))
+        stats = asyncio.run(process_plex_movies(db, client, plex_server, fm, server_id)) or {}
 
         # Refresh session to get updated sync_state values
         db.expire_all()
@@ -714,13 +740,11 @@ def sync_plex_movies_task(server_id: int, execution_id: int = None):
         if execution:
             execution.status = PlexExecutionStatus.SUCCESS
             execution.completed_at = datetime.utcnow()
-            # Get items processed from sync state
-            sync_state = db.query(PlexSyncState).filter(
-                PlexSyncState.server_id == server_id,
-                PlexSyncState.type == "movies"
-            ).first()
-            if sync_state:
-                execution.items_processed = (sync_state.items_added or 0) + (sync_state.items_deleted or 0)
+            execution.items_added = stats.get("items_added", 0)
+            execution.items_deleted = stats.get("items_deleted", 0)
+            execution.files_written = stats.get("files_written", 0)
+            # Kept in sync for the screens still reading items_processed
+            execution.items_processed = execution.items_added + execution.items_deleted
             db.commit()
 
         return f"Plex movies synced for {server.name}"
@@ -811,7 +835,7 @@ def sync_plex_series_task(server_id: int, execution_id: int = None):
 
         fm = FileManager(server.series_dir)
 
-        asyncio.run(process_plex_series(db, client, plex_server, fm, server_id))
+        stats = asyncio.run(process_plex_series(db, client, plex_server, fm, server_id)) or {}
 
         # Refresh session to get updated sync_state values
         db.expire_all()
@@ -820,13 +844,11 @@ def sync_plex_series_task(server_id: int, execution_id: int = None):
         if execution:
             execution.status = PlexExecutionStatus.SUCCESS
             execution.completed_at = datetime.utcnow()
-            # Get items processed from sync state
-            sync_state = db.query(PlexSyncState).filter(
-                PlexSyncState.server_id == server_id,
-                PlexSyncState.type == "series"
-            ).first()
-            if sync_state:
-                execution.items_processed = (sync_state.items_added or 0) + (sync_state.items_deleted or 0)
+            execution.items_added = stats.get("items_added", 0)
+            execution.items_deleted = stats.get("items_deleted", 0)
+            execution.files_written = stats.get("files_written", 0)
+            # Kept in sync for the screens still reading items_processed
+            execution.items_processed = execution.items_added + execution.items_deleted
             db.commit()
 
         return f"Plex series synced for {server.name}"

@@ -33,10 +33,42 @@ class SyncHistoryItem(BaseModel):
     items_added: int
     items_deleted: int
     items_total: int
+    files_written: int  # STRM files actually written to disk
+    item_unit: str  # What items_* counts: "movies", "episodes" or "items"
+    has_details: bool  # False for executions recorded before the split counters
     error_message: Optional[str]
 
     class Config:
         from_attributes = True
+
+
+def _item_unit(sync_type: Optional[str]) -> str:
+    """One STRM file per movie, per episode for a series sync"""
+    if sync_type == "movies":
+        return "movies"
+    if sync_type == "series":
+        return "episodes"
+    return "items"
+
+
+def _counters(exec_row) -> dict:
+    """
+    Read the counters of an execution.
+
+    Executions recorded before the split counters only have items_processed,
+    which lumped additions and deletions together.
+    """
+    added = exec_row.items_added or 0
+    deleted = exec_row.items_deleted or 0
+    has_details = bool(added or deleted or exec_row.files_written)
+
+    return {
+        "items_added": added,
+        "items_deleted": deleted,
+        "items_total": (added + deleted) if has_details else (exec_row.items_processed or 0),
+        "files_written": exec_row.files_written or 0,
+        "has_details": has_details,
+    }
 
 
 @router.get("/", response_model=List[SyncHistoryItem])
@@ -94,9 +126,8 @@ async def get_sync_history(
                 completed_at=exec_row.completed_at,
                 duration_seconds=duration,
                 status=exec_row.status.value if hasattr(exec_row.status, 'value') else str(exec_row.status),
-                items_added=exec_row.items_processed or 0,
-                items_deleted=0,
-                items_total=exec_row.items_processed or 0,
+                **_counters(exec_row),
+                item_unit=_item_unit(exec_sync_type),
                 error_message=exec_row.error_message
             ))
 
@@ -143,9 +174,8 @@ async def get_sync_history(
                 completed_at=exec_row.completed_at,
                 duration_seconds=duration,
                 status=exec_row.status.value if hasattr(exec_row.status, 'value') else str(exec_row.status),
-                items_added=exec_row.items_processed or 0,
-                items_deleted=0,
-                items_total=exec_row.items_processed or 0,
+                **_counters(exec_row),
+                item_unit=_item_unit(exec_sync_type),
                 error_message=exec_row.error_message
             ))
 

@@ -200,6 +200,31 @@ def _ensure_schema_up_to_date():
                         except Exception as e:
                             print(f"  ⚠️ Could not add {col_name}: {e}")
 
+        # 7. Check execution tables sync counters (added/deleted/files written)
+        # Runs last: steps 4 and 5 may have recreated those tables without them
+        exec_counter_cols = [
+            ("items_added", "INTEGER DEFAULT 0"),
+            ("items_deleted", "INTEGER DEFAULT 0"),
+            ("files_written", "INTEGER DEFAULT 0"),
+        ]
+        fresh_inspector = inspect(engine)
+        for table in ("schedule_executions", "plex_schedule_executions"):
+            if table not in fresh_inspector.get_table_names():
+                continue
+            table_cols = [c['name'] for c in fresh_inspector.get_columns(table)]
+            missing_counters = [m for m in exec_counter_cols if m[0] not in table_cols]
+
+            if missing_counters:
+                print(f"🔧 Missing {len(missing_counters)} columns in '{table}'. Repairing...")
+                with engine.connect() as conn:
+                    for col_name, col_type in missing_counters:
+                        try:
+                            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"))
+                            conn.commit()
+                            print(f"  ✅ Added {col_name}")
+                        except Exception as e:
+                            print(f"  ⚠️ Could not add {col_name}: {e}")
+
         print("✅ Database schema is up to date.")
             
     except Exception as e:

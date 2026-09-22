@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+from collections import defaultdict
 from app.core.celery_app import celery_app
 from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
@@ -180,9 +181,18 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
             )
             
             # 1. New Structure removal
-            if os.path.exists(target_info["target_dir"]):
-                shutil.rmtree(target_info["target_dir"])
-            
+            # Without a TMDB id the movie has no dedicated folder: target_dir is
+            # the category (or output) directory, which must not be wiped
+            has_own_folder = target_info["target_dir"] not in (target_info["cat_dir"], fm.output_dir)
+
+            if has_own_folder:
+                if os.path.exists(target_info["target_dir"]):
+                    shutil.rmtree(target_info["target_dir"])
+            else:
+                base = target_info["target_dir"]
+                await fm.delete_file(os.path.join(base, f"{target_info['filename_base']}.strm"))
+                await fm.delete_file(os.path.join(base, f"{target_info['filename_base']}.nfo"))
+
             # 2. Old Structure removal (fallback)
             safe_name = fm.sanitize_name(movie.name)
             old_path = f"{target_info['cat_dir']}/{safe_name}.strm"
@@ -199,7 +209,11 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
         batch_size = parallelism
         semaphore = asyncio.Semaphore(batch_size)
 
+        # STRM files actually written: an unchanged file is left untouched
+        strm_written = 0
+
         async def process_single_movie(movie):
+            nonlocal strm_written
             async with semaphore:
                 try:
                     stream_id = int(movie['stream_id'])
@@ -236,10 +250,13 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                     
                     url = xc.get_stream_url("movie", str(stream_id), ext)
                     
-                    await fm.write_strm(strm_path, url)
-                    
+                    if await fm.write_strm(strm_path, url):
+                        strm_written += 1
+
                     nfo_content = fm.generate_movie_nfo(movie, prefix_regex, format_date, clean_name)
-                    await fm.write_nfo(nfo_path, nfo_content)
+                    # Metadata fetch failed: never downgrade an existing NFO,
+                    # it would only touch its mtime and make Jellyfin rescan
+                    await fm.write_nfo(nfo_path, nfo_content, skip_if_exists=not metadata_ok)
 
                     # Update Cache
                     # We need to lock DB access or handle it after gather?
@@ -298,6 +315,11 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
                 f"not cached so the next sync retries them"
             )
 
+        logger.info(
+            f"Movies sync: {len(to_add_update)} movies added/updated, "
+            f"{len(to_delete)} deleted, {strm_written} STRM files written"
+        )
+
         sync_state.items_added = len(to_add_update)
         sync_state.items_deleted = len(to_delete)
         sync_state.status = SyncStatus.SUCCESS
@@ -305,6 +327,13 @@ async def process_movies(db: Session, xc: XtreamClient, fm: FileManager, subscri
 
         # Trigger Jellyfin library refresh
         trigger_jellyfin_refresh(db, "movies")
+
+        # Counters are movie-based here, one STRM file per movie
+        return {
+            "items_added": len(to_add_update),
+            "items_deleted": len(to_delete),
+            "files_written": strm_written,
+        }
 
     except Exception as e:
         logger.exception("Error syncing movies")
@@ -366,8 +395,16 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
         ).all()
         cached_episodes = {(e.series_id, e.episode_id): e for e in all_cached_episodes}
 
+        # Same rows indexed per series, to spot the episodes that vanished
+        cached_eps_by_series = defaultdict(dict)
+        for cached_ep in all_cached_episodes:
+            cached_eps_by_series[cached_ep.series_id][cached_ep.episode_id] = cached_ep
+
         to_delete = []
         current_ids = set()
+        # Counters are episode-based here, one STRM file per episode
+        episodes_deleted = 0
+        strm_written = 0
 
         for series in all_series:
             series_id = int(series['series_id'])
@@ -391,7 +428,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
             await fm.delete_directory_if_empty(target_info["cat_dir"])
 
             # Delete episode cache for this series
-            db.query(EpisodeCache).filter(
+            episodes_deleted += db.query(EpisodeCache).filter(
                 EpisodeCache.subscription_id == subscription_id,
                 EpisodeCache.series_id == series.series_id
             ).delete()
@@ -411,7 +448,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
         total_episodes_skipped = 0
 
         async def process_single_series(series):
-            nonlocal total_episodes_added, total_episodes_skipped
+            nonlocal total_episodes_added, total_episodes_skipped, strm_written, episodes_deleted
             async with semaphore:
                 try:
                     series_id = int(series['series_id'])
@@ -445,6 +482,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                     await fm.write_nfo(nfo_path, fm.generate_show_nfo(series, prefix_regex, format_date, clean_name))
 
                     episodes_to_cache = []
+                    current_ep_ids = set()
 
                     for season_key, episodes in episodes_data.items():
                         season_num = int(season_key)
@@ -463,6 +501,7 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                             ep_id = int(ep['id'])
                             container = ep['container_extension']
                             title = ep.get('title', '')
+                            current_ep_ids.add(ep_id)
 
                             # Check episode cache - skip if unchanged
                             cache_key = (series_id, ep_id)
@@ -481,29 +520,15 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                             # New or changed episode - process it
                             total_episodes_added += 1
 
-                            formatted_ep = f"S{season_num:02d}E{ep_num:02d}"
-                            safe_ep_title = ""
-
-                            if title:
-                                # Remove extension if present in title
-                                if title.lower().endswith(f".{container}"):
-                                    title = title[:-len(container)-1]
-
-                                safe_ep_title = fm.sanitize_name(title)
-
-                            if include_series_name:
-                                 filename_base = f"{target_info['safe_series_name']} - {formatted_ep}"
-                            else:
-                                 filename_base = formatted_ep
-
-                            if safe_ep_title:
-                                 filename = f"{filename_base} - {safe_ep_title}"
-                            else:
-                                 filename = filename_base
+                            filename = fm.build_episode_filename(
+                                target_info['safe_series_name'], season_num, ep_num,
+                                title, container, include_series_name
+                            )
 
                             strm_path = f"{current_dir}/{filename}.strm"
                             url = xc.get_stream_url("series", str(ep_id), container)
-                            await fm.write_strm(strm_path, url)
+                            if await fm.write_strm(strm_path, url):
+                                strm_written += 1
 
                             # Episode NFO
                             ep_nfo_path = f"{current_dir}/{filename}.nfo"
@@ -519,6 +544,31 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                                 'container_extension': container
                             })
 
+                    # Episodes that vanished from the panel: drop their files
+                    deleted_ep_ids = []
+
+                    for stale_id, stale_ep in cached_eps_by_series.get(series_id, {}).items():
+                        if stale_id in current_ep_ids:
+                            continue
+
+                        stale_season = stale_ep.season_num or 0
+                        if use_season_folders:
+                            stale_dir = f"{series_dir}/Season {stale_season:02d}"
+                        else:
+                            stale_dir = series_dir
+
+                        stale_filename = fm.build_episode_filename(
+                            target_info['safe_series_name'], stale_season, stale_ep.episode_num or 0,
+                            stale_ep.title, stale_ep.container_extension, include_series_name
+                        )
+
+                        await fm.delete_file(f"{stale_dir}/{stale_filename}.strm")
+                        await fm.delete_file(f"{stale_dir}/{stale_filename}.nfo")
+                        await fm.delete_directory_if_empty(stale_dir)
+
+                        deleted_ep_ids.append(stale_id)
+                        episodes_deleted += 1
+
                     return {
                         'action': 'update_cache',
                         'data': {
@@ -526,7 +576,8 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                             'name': name,
                             'category_id': cat_id,
                             'tmdb_id': str(tmdb_id) if tmdb_id else None,
-                            'episodes': episodes_to_cache
+                            'episodes': episodes_to_cache,
+                            'deleted_episode_ids': deleted_ep_ids
                         }
                     }
                 except Exception as e:
@@ -573,17 +624,35 @@ async def process_series(db: Session, xc: XtreamClient, fm: FileManager, subscri
                         cached_ep.title = ep_data['title']
                         cached_ep.container_extension = ep_data['container_extension']
 
+                    # Forget the episodes whose files were just removed
+                    for stale_id in d.get('deleted_episode_ids', []):
+                        stale_ep = cached_episodes.pop((series_id, stale_id), None)
+                        cached_eps_by_series.get(series_id, {}).pop(stale_id, None)
+                        if stale_ep is not None:
+                            db.delete(stale_ep)
+
             db.commit()
 
-        logger.info(f"Series sync: {total_episodes_added} episodes added/updated, {total_episodes_skipped} skipped (unchanged)")
+        logger.info(
+            f"Series sync: {total_episodes_added} episodes added/updated, "
+            f"{total_episodes_skipped} skipped (unchanged), "
+            f"{episodes_deleted} deleted with {len(to_delete)} series, "
+            f"{strm_written} STRM files written"
+        )
 
         sync_state.items_added = total_episodes_added
-        sync_state.items_deleted = len(to_delete)
+        sync_state.items_deleted = episodes_deleted
         sync_state.status = SyncStatus.SUCCESS
         db.commit()
 
         # Trigger Jellyfin library refresh
         trigger_jellyfin_refresh(db, "series")
+
+        return {
+            "items_added": total_episodes_added,
+            "items_deleted": episodes_deleted,
+            "files_written": strm_written,
+        }
 
     except Exception as e:
         logger.exception("Error syncing series")
@@ -635,7 +704,7 @@ def sync_movies_task(subscription_id: int, execution_id: int = None):
         xc = build_xtream_client(db, sub, "SYNC_PARALLELISM_MOVIES")
         fm = FileManager(sub.movies_dir)
 
-        asyncio.run(_run_and_close(process_movies(db, xc, fm, subscription_id), xc))
+        stats = asyncio.run(_run_and_close(process_movies(db, xc, fm, subscription_id), xc)) or {}
 
         # Refresh session to get updated sync_state values
         db.expire_all()
@@ -644,13 +713,11 @@ def sync_movies_task(subscription_id: int, execution_id: int = None):
         if execution:
             execution.status = ExecutionStatus.SUCCESS
             execution.completed_at = datetime.utcnow()
-            # Get items processed from sync state
-            sync_state = db.query(SyncState).filter(
-                SyncState.subscription_id == subscription_id,
-                SyncState.type == SyncType.MOVIES
-            ).first()
-            if sync_state:
-                execution.items_processed = (sync_state.items_added or 0) + (sync_state.items_deleted or 0)
+            execution.items_added = stats.get("items_added", 0)
+            execution.items_deleted = stats.get("items_deleted", 0)
+            execution.files_written = stats.get("files_written", 0)
+            # Kept in sync for the screens still reading items_processed
+            execution.items_processed = execution.items_added + execution.items_deleted
             db.commit()
 
         return f"Movies synced successfully for {sub.name}"
@@ -708,7 +775,7 @@ def sync_series_task(subscription_id: int, execution_id: int = None):
         xc = build_xtream_client(db, sub, "SYNC_PARALLELISM_SERIES")
         fm = FileManager(sub.series_dir)
 
-        asyncio.run(_run_and_close(process_series(db, xc, fm, subscription_id), xc))
+        stats = asyncio.run(_run_and_close(process_series(db, xc, fm, subscription_id), xc)) or {}
 
         # Refresh session to get updated sync_state values
         db.expire_all()
@@ -717,13 +784,11 @@ def sync_series_task(subscription_id: int, execution_id: int = None):
         if execution:
             execution.status = ExecutionStatus.SUCCESS
             execution.completed_at = datetime.utcnow()
-            # Get items processed from sync state
-            sync_state = db.query(SyncState).filter(
-                SyncState.subscription_id == subscription_id,
-                SyncState.type == SyncType.SERIES
-            ).first()
-            if sync_state:
-                execution.items_processed = (sync_state.items_added or 0) + (sync_state.items_deleted or 0)
+            execution.items_added = stats.get("items_added", 0)
+            execution.items_deleted = stats.get("items_deleted", 0)
+            execution.files_written = stats.get("files_written", 0)
+            # Kept in sync for the screens still reading items_processed
+            execution.items_processed = execution.items_added + execution.items_deleted
             db.commit()
 
         return f"Series synced successfully for {sub.name}"
